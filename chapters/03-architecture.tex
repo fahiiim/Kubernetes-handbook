@@ -1,0 +1,241 @@
+\kchapter{Kubernetes Architecture}{control-plane}
+
+\begin{objectives}
+\begin{itemize}
+  \item what a cluster, a node, and the control plane are;
+  \item the job of every control-plane component: API server, etcd,
+        scheduler, controller manager, cloud controller manager;
+  \item the job of every node component: kubelet, kube-proxy, container runtime;
+  \item what actually happens, step by step, when you create a Deployment.
+\end{itemize}
+\end{objectives}
+
+\section{The cluster at a glance}
+
+A Kubernetes \kterm{cluster} is a set of machines (physical or virtual) called
+\kterm{nodes}, split into two roles:
+
+\begin{itemize}
+  \item the \kterm{control plane} --- the ``brain'' that stores desired state and
+        makes decisions;
+  \item \kterm{worker nodes} --- the ``muscle'' that actually runs your containers.
+\end{itemize}
+
+\begin{center}
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  comp/.style={draw=k8sblue, fill=white, rounded corners=4pt, line width=0.8pt,
+               minimum width=2.75cm, minimum height=2.2cm, align=center,
+               font=\footnotesize\bfseries, text=k8snavy},
+  small/.style={draw=k8sblue, fill=white, rounded corners=4pt, line width=0.8pt,
+               minimum width=2.3cm, minimum height=1.9cm, align=center,
+               font=\scriptsize\bfseries, text=k8snavy},
+  pod/.style={fill=k8sblue!15, draw=k8sblue!60, rounded corners=3pt,
+              minimum width=1.25cm, minimum height=0.9cm, font=\scriptsize, align=center},
+  >={Stealth[length=2.6mm]}]
+
+  % ---------- control plane
+  \node[comp] (etcd)  at (-6.2,0) {\kimg[1cm]{etcd}\\etcd};
+  \node[comp] (api)   at (-3.1,0) {\kimg[1cm]{api}\\kube-apiserver};
+  \node[comp] (sched) at (0,0)    {\kimg[1cm]{sched}\\kube-scheduler};
+  \node[comp] (cm)    at (3.1,0)  {\kimg[1cm]{c-m}\\kube-controller-\\manager};
+  \node[comp] (ccm)   at (6.2,0)  {\kimg[1cm]{c-c-m}\\cloud-controller-\\manager};
+  \begin{scope}[on background layer]
+    \node[fill=k8slight, draw=k8sblue, line width=1.2pt, rounded corners=10pt,
+          inner sep=0.45cm, fit=(etcd)(ccm), label={[font=\bfseries, text=k8sblue]above:\faBrain\ \ CONTROL PLANE}] (cp) {};
+  \end{scope}
+  \draw[<->, thick, k8sblue] (etcd) -- (api);
+  \draw[<->, thick, k8sblue] (api) -- (sched);
+  \draw[<->, thick, k8sblue] (api.north) to[bend left=22] (cm.north);
+  \draw[<->, thick, k8sblue] (api.north) to[bend left=28] (ccm.north);
+
+  % cloud
+  \node[font=\Huge, text=k8sgray] (cloud) at (10.0,0) {\faCloud};
+  \node[font=\scriptsize, text=k8sgray, below=-1pt of cloud] {Cloud API};
+  \draw[<->, thick, k8sgray, dashed] (ccm) -- (cloud);
+
+  % user
+  \node[font=\Huge, text=k8snavy] (user) at (-10.0,0) {\faUserCircle};
+  \node[font=\scriptsize\bfseries, text=k8snavy, below=0pt of user] {you + kubectl};
+  \draw[->, line width=1.4pt, k8sorange] (user) -- node[above, font=\scriptsize, text=k8sorange]{HTTPS} (cp.west |- user);
+
+  % ---------- worker nodes
+  \foreach \nx/\nn in {-4.6/1, 4.6/2}{
+    \node[small] (kubelet\nn) at (\nx-2.6,-5.0) {\kimg[0.9cm]{kubelet}\\kubelet};
+    \node[small] (proxy\nn)   at (\nx,-5.0)     {\kimg[0.9cm]{k-proxy}\\kube-proxy};
+    \node[small] (cri\nn)     at (\nx+2.6,-5.0) {\kimg[0.9cm]{containerd}\\container\\runtime};
+    \node[pod] (pa\nn) at (\nx-2.6,-7.0) {\kimg[0.45cm]{pod}\\Pod};
+    \node[pod] (pb\nn) at (\nx-0.9,-7.0) {\kimg[0.45cm]{pod}\\Pod};
+    \node[pod] (pc\nn) at (\nx+0.8,-7.0) {\kimg[0.45cm]{pod}\\Pod};
+    \node[pod] (pd\nn) at (\nx+2.6,-7.0) {\kimg[0.45cm]{pod}\\Pod};
+    \begin{scope}[on background layer]
+      \node[fill=k8sblue!6, draw=k8sdeep, line width=1.1pt, rounded corners=10pt,
+            inner sep=0.35cm, fit=(kubelet\nn)(cri\nn)(pa\nn)(pd\nn),
+            label={[font=\bfseries\small, text=k8sdeep]below:\faServer\ \ WORKER NODE \nn}] (node\nn) {};
+    \end{scope}
+    \draw[<->, thick, k8sblue] (kubelet\nn.north) -- (kubelet\nn.north |- cp.south);
+    \draw[->, thick, k8sgray] (kubelet\nn) -- (cri\nn.west |- kubelet\nn) ;
+  }
+\end{tikzpicture}}
+\end{center}
+
+\begin{keyidea}
+\textbf{Everything talks to the API server, and only the API server talks to
+etcd.} The scheduler, controllers, kubelets, \kc{kubectl}, and your CI system
+are all just clients of one HTTP API.
+\end{keyidea}
+
+\section{Control-plane components}
+
+\subsection{\kicon{api}\ kube-apiserver --- the front door}
+
+The API server exposes the Kubernetes REST API. Every create, read, update, or
+delete --- from you, from a controller, or from a node --- goes through it. For
+each request it:
+
+\begin{enumerate}
+  \item \textbf{authenticates} the caller (who are you? certificate, token, OIDC);
+  \item \textbf{authorises} the action (are you allowed? usually RBAC);
+  \item runs \textbf{admission control} (should this be modified or rejected?
+        e.g.\ inject defaults, enforce policies);
+  \item \textbf{validates} the object against its schema;
+  \item \textbf{persists} it to etcd and notifies anyone \emph{watching}.
+\end{enumerate}
+
+The API server is stateless, so you can run several copies behind a load balancer.
+
+\subsection{\kicon{etcd}\ etcd --- the memory}
+
+etcd is a distributed, strongly consistent key--value store. It holds the
+\emph{entire} state of the cluster: every Pod, Service, Secret, and config. It
+uses the Raft consensus algorithm, so production clusters run 3 or 5 etcd
+members and tolerate the loss of 1 or 2.
+
+\begin{warningbox}
+If you lose etcd and have no backup, you lose your cluster's definition.
+Back it up regularly (Chapter~\ref{ch:production}). Managed services do this for you.
+\end{warningbox}
+
+\subsection{\kicon{sched}\ kube-scheduler --- the matchmaker}
+
+When a new Pod has no node assigned, the scheduler picks one. It works in two phases:
+
+\begin{itemize}
+  \item \textbf{Filtering}: remove nodes that cannot run the Pod (not enough
+        CPU/memory, wrong labels, taints, missing volumes, port conflicts).
+  \item \textbf{Scoring}: rank the remaining nodes (spread replicas apart,
+        prefer nodes with the image cached, balance utilisation) and pick the best.
+\end{itemize}
+
+The scheduler only \emph{decides}. It writes the chosen node name into the Pod
+object; it does not start anything.
+
+\subsection{\kicon{c-m}\ kube-controller-manager --- the autopilots}
+
+A single binary running dozens of controllers, each owning one kind of object:
+the Deployment controller, ReplicaSet controller, Node controller (notices dead
+nodes), Job controller, EndpointSlice controller, ServiceAccount controller,
+and many more. Each runs the reconcile loop from Chapter 2.
+
+\subsection{\kicon{c-c-m}\ cloud-controller-manager --- the cloud bridge}
+
+Only present on cloud clusters. It talks to the cloud provider's API to create
+load balancers for Services, attach routes, and learn when cloud VMs are deleted.
+
+\section{Node components}
+
+\subsection{\kicon{kubelet}\ kubelet --- the node agent}
+
+Runs on every node. It watches the API server for Pods assigned to its node,
+asks the container runtime to start their containers, mounts volumes, runs
+health probes, and reports status back. If a container dies, the kubelet
+restarts it.
+
+\subsection{\kicon{k-proxy}\ kube-proxy --- the traffic cop}
+
+Implements Services on each node by programming packet-forwarding rules
+(iptables, IPVS, or nftables) so that traffic to a Service's virtual IP lands on
+a healthy Pod. Some network plugins (like Cilium) replace kube-proxy with eBPF.
+
+\subsection{\kicon{containerd}\ Container runtime}
+
+The software that actually pulls images and runs containers ---
+\textbf{containerd} or \textbf{CRI-O}. The kubelet talks to it through the
+\kterm{Container Runtime Interface} (CRI). Images built with Docker run fine,
+because they are standard OCI images.
+
+\section{Add-ons you will meet}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{3.6cm} L}
+\kheader \kth{Add-on} & \kth{Purpose} \\
+CoreDNS & Cluster DNS: lets Pods reach \kc{my-service.my-namespace} by name. \\
+CNI plugin & Pod networking. Examples: Calico, Cilium, Flannel, kindnet. \\
+CSI drivers & Storage plugins for cloud disks, NFS, Ceph, etc. \\
+metrics-server & Live CPU/memory figures for \kc{kubectl top} and autoscaling. \\
+Ingress / Gateway controller & HTTP(S) routing from outside the cluster. \\
+\end{tabularx}
+\end{center}
+
+\section{Walkthrough: what happens when you create a Deployment}
+
+You run \kc{kubectl apply -f web.yaml}, asking for a Deployment with 3 replicas.
+
+\begin{center}
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  actor/.style={fill=k8sblue, text=white, rounded corners=4pt, minimum width=2.3cm,
+                minimum height=0.9cm, font=\footnotesize\bfseries, align=center},
+  msg/.style={->, >={Stealth[length=2.4mm]}, thick, k8snavy},
+  lab/.style={font=\scriptsize, fill=white, inner sep=1.5pt, text=k8snavy}]
+  \foreach \n/\x/\txt in {k/0/kubectl, a/3/API server, e/6/etcd, d/9/Deployment\\controller,
+                        r/12/ReplicaSet\\controller, s/15/Scheduler, l/18/kubelet}{
+    \node[actor] (\n) at (\x,0) {\txt};
+    \draw[k8smid, dashed, thick] (\n.south) -- (\x,-9.3);
+  }
+  \draw[msg] (0,-1.0) -- node[lab, above]{1. POST Deployment} (3,-1.0);
+  \draw[msg] (3,-1.7) -- node[lab, above]{2. store} (6,-1.7);
+  \draw[msg] (3,-2.5) -- node[lab, above]{3. watch event: new Deployment} (9,-2.5);
+  \draw[msg] (9,-3.3) -- node[lab, above]{4. create ReplicaSet} (3,-3.3);
+  \draw[msg] (3,-4.1) -- node[lab, above]{5. watch: new ReplicaSet} (12,-4.1);
+  \draw[msg] (12,-4.9) -- node[lab, above]{6. create 3 Pods (no node yet)} (3,-4.9);
+  \draw[msg] (3,-5.7) -- node[lab, above]{7. watch: unscheduled Pods} (15,-5.7);
+  \draw[msg] (15,-6.5) -- node[lab, above]{8. bind each Pod to a node} (3,-6.5);
+  \draw[msg] (3,-7.3) -- node[lab, above]{9. watch: Pod assigned to me} (18,-7.3);
+  \draw[msg] (18,-8.1) -- node[lab, above]{10. start containers, report status Running} (3,-8.1);
+  \draw[msg] (3,-8.8) -- node[lab, above]{11. persist status} (6,-8.8);
+\end{tikzpicture}}
+\end{center}
+
+Notice that no component orders another around. Each one simply \emph{watches}
+the API for objects it cares about and reacts. This loose coupling is what makes
+Kubernetes so robust and extensible.
+
+\begin{deepdive}
+Controllers do not poll. They open long-lived \emph{watch} connections to the
+API server and keep a local cache (an ``informer''). Every object carries a
+\kc{resourceVersion}; updates use optimistic concurrency, so two controllers can
+never silently overwrite each other's changes.
+\end{deepdive}
+
+\section{Kubernetes objects: spec and status}
+
+Almost every object you create has two halves:
+
+\begin{itemize}
+  \item \kc{spec} --- written by \emph{you}: the desired state;
+  \item \kc{status} --- written by \emph{Kubernetes}: the observed state.
+\end{itemize}
+
+Controllers spend their lives trying to make \kc{status} match \kc{spec}.
+
+\begin{recap}
+\begin{itemize}
+  \item A cluster = control plane (API server, etcd, scheduler, controller
+        managers) + worker nodes (kubelet, kube-proxy, runtime).
+  \item The API server is the only door; etcd is the only memory.
+  \item Components cooperate by watching the API, not by calling each other.
+  \item Objects have a \kc{spec} (desired) and a \kc{status} (actual).
+\end{itemize}
+\end{recap}

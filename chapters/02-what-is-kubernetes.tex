@@ -1,0 +1,172 @@
+\kchapter{What Is Kubernetes?}{k8s-logo}
+
+\begin{objectives}
+\begin{itemize}
+  \item what Kubernetes is, where it came from, and why it won;
+  \item the single most important idea: \emph{declarative desired state};
+  \item the control loop that makes Kubernetes ``self-healing'';
+  \item what Kubernetes does \emph{not} do for you.
+\end{itemize}
+\end{objectives}
+
+\section{A one-sentence definition}
+
+\begin{keyidea}
+\textbf{Kubernetes is an open-source platform that runs and manages
+containerised applications across a group of machines, continuously working to
+keep the system in the state you described.}
+\end{keyidea}
+
+The name comes from Greek \textit{kubern\=et\=es}, meaning ``helmsman'' or
+``pilot'' --- the person who steers a ship. That is why the logo is a ship's
+wheel with seven spokes. You will often see it written \textbf{K8s}: a ``K'',
+then 8 letters, then an ``s''.
+
+\section{A short history}
+
+\begin{center}
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  ev/.style={fill=k8sblue, circle, inner sep=3pt},
+  yr/.style={font=\bfseries\small, text=k8sblue},
+  tx/.style={font=\scriptsize, text width=2.3cm, align=center, text=k8snavy}]
+  \draw[line width=2pt, k8smid] (0,0) -- (19,0);
+  \foreach \x/\y/\txt [count=\idx] in {
+    0.8/2003/Google builds \textbf{Borg} to run its internal services,
+    3.5/2013/Docker makes containers easy for everyone,
+    6.2/2014/Google open-sources \textbf{Kubernetes},
+    8.9/2015/v1.0 released; \textbf{CNCF} founded,
+    11.6/2018/K8s is the first project to \textbf{graduate} from CNCF,
+    14.3/2022/dockershim removed; containerd and CRI-O are the norm,
+    17.4/Today/Every major cloud offers managed Kubernetes}{
+    \node[ev] at (\x,0) {};
+    \ifodd\idx
+      \node[yr] at (\x,0.5) {\y}; \node[tx, anchor=south] at (\x,0.85) {\txt};
+    \else
+      \node[yr] at (\x,-0.5) {\y}; \node[tx, anchor=north] at (\x,-0.85) {\txt};
+    \fi
+  }
+\end{tikzpicture}}
+\end{center}
+
+Kubernetes is now maintained by thousands of contributors under the
+\kicon{cncf} Cloud Native Computing Foundation. A new minor version ships
+roughly every four months, and each is supported for about a year.
+
+\section{What Kubernetes gives you}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{4.0cm} L}
+\kheader \kth{Capability} & \kth{What it means for you} \\
+\faServer\ Scheduling & You say ``run 5 copies''; Kubernetes picks the
+                         machines with enough free capacity. \\
+\faHeartbeat\ Self-healing & Crashed containers are restarted; Pods on a dead
+                         machine are recreated elsewhere. \\
+\faBalanceScale\ Service discovery \& load balancing & Every app gets a
+                         stable name and virtual IP; traffic is spread across
+                         healthy copies. \\
+\faIcon{sync-alt}\ Rolling updates \& rollbacks & New versions replace old ones
+                         gradually, with automatic rollback on demand. \\
+\faChartLine\ Autoscaling & Add or remove copies (or whole machines)
+                         based on load. \\
+\faLock\ Config \& secrets & Inject configuration and credentials without
+                         rebuilding images. \\
+\faHdd\ Storage orchestration & Attach cloud disks, NFS, or local volumes
+                         to the apps that need them. \\
+\faCogs\ Extensibility & Teach Kubernetes new resource types and automate
+                         anything with Operators. \\
+\end{tabularx}
+\end{center}
+
+\section{The big idea: declarative desired state}
+
+There are two ways to tell a system what to do.
+
+\begin{itemize}
+  \item \textbf{Imperative}: give step-by-step commands. ``Start a container on
+        server 3. Now start another on server 5. Now open port 80.''
+  \item \textbf{Declarative}: describe the end result. ``I want 3 copies of
+        \kc{web:2.1} running, reachable on port 80.''
+\end{itemize}
+
+Kubernetes is declarative. You write down the \kterm{desired state} in a file
+(called a \kterm{manifest}, usually YAML) and hand it to the cluster. Kubernetes
+stores it, compares it with the \kterm{actual state} of the world, and takes
+whatever actions are needed to make reality match your wish.
+
+\begin{analogy}
+A thermostat. You do not tell the heater ``run for 12 minutes''. You set the
+desired temperature to 21\,\textdegree C. The thermostat measures the room,
+compares, and switches the heater on or off --- forever. If someone opens a
+window, it reacts automatically. Kubernetes is a thermostat for your software.
+\end{analogy}
+
+\section{The reconciliation loop}
+
+Inside Kubernetes, many small programs called \kterm{controllers} each run the
+same endless loop:
+
+\begin{center}
+\begin{tikzpicture}[
+  box/.style={draw=k8sblue, fill=k8slight, rounded corners=6pt, line width=1pt,
+              minimum width=3.6cm, minimum height=1.1cm, align=center,
+              font=\small\bfseries, text=k8snavy},
+  >={Stealth[length=3mm]}]
+  \node[box] (obs) at (0,2.2) {\faEye\ \ Observe\\[-2pt]\scriptsize\mdseries actual state};
+  \node[box] (diff) at (4.6,0) {\faBalanceScale\ \ Compare\\[-2pt]\scriptsize\mdseries with desired state};
+  \node[box] (act) at (0,-2.2) {\faTools\ \ Act\\[-2pt]\scriptsize\mdseries create / delete / update};
+  \node[regular polygon, regular polygon sides=7, fill=k8sblue, text=white,
+        minimum size=2.2cm, font=\bfseries\small, align=center] (c) at (-4.4,0)
+        {Desired\\state};
+  \draw[->, line width=1.4pt, k8sblue] (obs) to[bend left=25] (diff);
+  \draw[->, line width=1.4pt, k8sblue] (diff) to[bend left=25] (act);
+  \draw[->, line width=1.4pt, k8sblue] (act) to[bend left=25] (obs);
+  \draw[->, dashed, line width=1pt, k8sgray] (c) -- (diff.west |- c) node[pos=0.25, above, font=\scriptsize, text=k8sgray]{you declare};
+\end{tikzpicture}
+\end{center}
+
+Example: you declare ``3 replicas''. One machine crashes, taking a copy with it.
+The controller observes 2, compares with 3, and acts by creating one more. No
+human involved. This is what people mean by \emph{self-healing}.
+
+\begin{keyidea}
+In Kubernetes you almost never ``do'' things directly. You \emph{change the
+desired state}, and controllers do the work. Learn to think in terms of
+``what should exist'', not ``what should I run''.
+\end{keyidea}
+
+\section{What Kubernetes is not}
+
+\begin{itemize}
+  \item It does \textbf{not} build your source code or images (CI tools do).
+  \item It is \textbf{not} a Platform-as-a-Service like Heroku out of the box;
+        you assemble the platform from building blocks.
+  \item It does \textbf{not} provide databases, message queues or logging by
+        itself, although it can run all of them.
+  \item It is \textbf{not} always the right tool. A single small app may be
+        happier on one VM or a serverless platform. Kubernetes shines when you
+        have many services, teams, or environments.
+\end{itemize}
+
+\section{Where Kubernetes runs}
+
+\begin{itemize}
+  \item \textbf{Local, for learning}: kind, minikube, k3d, Docker Desktop, Rancher Desktop.
+  \item \textbf{Managed cloud}: Amazon EKS, Google GKE, Azure AKS, DigitalOcean
+        DOKS, Linode LKE, and others. The provider runs the control plane for you.
+  \item \textbf{Self-managed}: \kc{kubeadm}, k3s, RKE2, Talos, OpenShift, on
+        your own VMs or bare metal.
+\end{itemize}
+
+The same manifests work everywhere. That portability is a huge part of why
+Kubernetes won.
+
+\begin{recap}
+\begin{itemize}
+  \item Kubernetes (K8s) orchestrates containers across many machines.
+  \item You declare desired state; controllers reconcile actual state toward it.
+  \item That loop gives you self-healing, scaling, and safe rollouts.
+  \item Kubernetes is a foundation for building platforms, not a finished PaaS.
+\end{itemize}
+\end{recap}

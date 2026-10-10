@@ -1,0 +1,219 @@
+\kchapter{CI/CD and GitOps}{argo}
+
+\begin{objectives}
+\begin{itemize}
+  \item the difference between Continuous Integration and Continuous Delivery;
+  \item push-based vs.\ pull-based (GitOps) deployment;
+  \item a CI pipeline that tests, builds, scans, and publishes images;
+  \item GitOps with Argo CD: Applications, sync, self-heal, rollback;
+  \item environment promotion and progressive delivery.
+\end{itemize}
+\end{objectives}
+
+\section{From commit to cluster}
+
+\begin{center}
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  st/.style={fill=#1, text=white, rounded corners=5pt, minimum width=2.25cm,
+             minimum height=1.35cm, align=center, font=\scriptsize\bfseries},
+  >={Stealth[length=2.6mm]}]
+  \node[st=k8sgray]   (c) at (0,0)    {\Large\faCodeBranch\\commit};
+  \node[st=k8sblue]   (t) at (2.7,0)  {\Large\faVial\\test};
+  \node[st=k8sblue]   (b) at (5.4,0)  {\Large\faDocker\\build image};
+  \node[st=k8sblue]   (s) at (8.1,0)  {\Large\faIcon{shield-alt}\\scan};
+  \node[st=k8sdeep]   (p) at (10.8,0) {\Large\faUpload\\push to\\registry};
+  \node[st=k8sdeep]   (g) at (13.5,0) {\Large\faIcon{git-alt}\\update tag\\in Git};
+  \node[st=k8sorange] (a) at (16.2,0) {\kimg[0.6cm]{argo}\\Argo CD\\syncs};
+  \node[st=k8snavy]   (k) at (18.9,0) {\kimg[0.6cm]{k8s-logo-white}\\cluster};
+  \foreach \x/\y in {c/t,t/b,b/s,s/p,p/g,g/a,a/k} \draw[->, thick, k8snavy] (\x) -- (\y);
+  \draw[decorate, decoration={brace, amplitude=6pt}, k8sblue, thick]
+       (-1.1,0.95) -- (14.6,0.95) node[midway, above=7pt, font=\small\bfseries, text=k8sblue]{CI (e.g.\ GitHub Actions)};
+  \draw[decorate, decoration={brace, amplitude=6pt, mirror}, k8sorange, thick]
+       (15.1,-0.95) -- (20.0,-0.95) node[midway, below=7pt, font=\small\bfseries, text=k8sorange]{CD (GitOps)};
+\end{tikzpicture}}
+\end{center}
+
+\begin{itemize}
+  \item \kterm{Continuous Integration (CI)}: every change is automatically
+        tested, built into an image, scanned, and published.
+  \item \kterm{Continuous Delivery (CD)}: every published version can be deployed
+        to an environment automatically and safely.
+\end{itemize}
+
+\section{Push vs.\ pull}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{2.4cm} L L}
+\kheader \kth{} & \kth{Push (CI runs \kc{kubectl}/\kc{helm})} & \kth{Pull / GitOps (agent in cluster)} \\
+Who deploys & The CI runner, with cluster credentials. & A controller inside the cluster. \\
+Credentials & CI must hold a powerful kubeconfig. & Cluster only needs read access to Git. \\
+Drift & Manual changes go unnoticed. & Detected and (optionally) reverted. \\
+Audit / rollback & Re-run old pipeline. & \kc{git log} / \kc{git revert}. \\
+Tools & GitHub Actions, GitLab CI, Jenkins. & Argo CD, Flux. \\
+\end{tabularx}
+\end{center}
+
+\begin{keyidea}
+\textbf{GitOps}: the desired state of every environment lives in Git. An agent
+in the cluster continuously makes the cluster match Git. To deploy, you merge a
+pull request. To roll back, you revert it. Git becomes your audit log.
+\end{keyidea}
+
+\section{A CI pipeline with GitHub Actions}
+
+\begin{yamlcode}{.github/workflows/ci.yaml}
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt -r requirements-dev.txt && pytest -q
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          push: ${{ github.event_name == 'push' }}
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+\end{yamlcode}
+
+The capstone (Chapter~\ref{ch:capstone-devops}) extends this with scanning,
+manifest validation, and an automatic GitOps update.
+
+\section{GitOps with Argo CD}
+
+\kicon{argo}~\textbf{Argo CD} is a CNCF-graduated GitOps controller with a
+web UI.
+
+\begin{bashcode}{terminal}
+kubectl create namespace argocd
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath='{.data.password}' | base64 -d; echo
+kubectl -n argocd port-forward svc/argocd-server 8443:443
+# open https://localhost:8443  (user: admin)
+\end{bashcode}
+
+\subsection{The Application object}
+
+\begin{yamlcode}{argocd-app.yaml}
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: shop-prod
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/example/shop-deploy.git
+    targetRevision: main
+    path: k8s/overlays/prod          # Kustomize, Helm chart, or plain YAML
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: shop-prod
+  syncPolicy:
+    automated:
+      prune: true                    # delete objects removed from Git
+      selfHeal: true                 # revert manual changes in the cluster
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff: { duration: 10s, factor: 2, maxDuration: 3m }
+\end{yamlcode}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{3.0cm} L}
+\kheader \kth{Status} & \kth{Meaning} \\
+\textcolor{k8sgreen}{\textbf{Synced}} & The cluster matches Git. \\
+\textcolor{k8sorange}{\textbf{OutOfSync}} & Git and the cluster differ; Argo CD will sync (if automated) or wait for you. \\
+\textcolor{k8sgreen}{\textbf{Healthy}} & Resources are running correctly (Deployments available, etc.). \\
+\textcolor{k8sred}{\textbf{Degraded}} & Something is failing (CrashLoop, failed rollout). \\
+\end{tabularx}
+\end{center}
+
+\begin{protip}
+Use the \textbf{app-of-apps} pattern or an \textbf{ApplicationSet} to manage
+many Applications (every service \(\times\) every environment) from a single
+template, and keep your \emph{application source} repo separate from your
+\emph{deployment config} repo or folder.
+\end{protip}
+
+\section{Environment promotion}
+
+\begin{itemize}
+  \item \textbf{Dev}: CI updates the image tag in \kc{overlays/dev} on every
+        merge to \kc{main}; Argo CD auto-syncs.
+  \item \textbf{Staging}: a pull request copies the tag to \kc{overlays/staging};
+        automated tests run against it.
+  \item \textbf{Production}: a reviewed, approved pull request promotes the same
+        immutable image (same digest) to \kc{overlays/prod}.
+\end{itemize}
+
+Tools such as \textbf{Argo CD Image Updater}, \textbf{Kargo}, or \textbf{Flux}
+image automation can create these promotion commits for you.
+
+\section{Progressive delivery}
+
+\textbf{Argo Rollouts} replaces a Deployment with a \kc{Rollout} that does
+canary or blue/green releases, shifting traffic in steps and checking metrics
+(e.g.\ Prometheus error rate) before each step. If metrics degrade, it aborts
+and rolls back automatically.
+
+\begin{yamlcode}{rollout-canary.yaml}
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: api
+spec:
+  replicas: 5
+  strategy:
+    canary:
+      steps:
+        - setWeight: 10
+        - pause: { duration: 5m }
+        - analysis:
+            templates:
+              - templateName: error-rate-below-1pct
+        - setWeight: 50
+        - pause: { duration: 10m }
+  selector:
+    matchLabels: { app: api }
+  template:
+    metadata:
+      labels: { app: api }
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/example/api:1.5.0
+\end{yamlcode}
+
+\begin{recap}
+\begin{itemize}
+  \item CI: test, build, scan, publish. CD: deploy safely and repeatably.
+  \item GitOps keeps environments in Git and lets an in-cluster agent pull changes.
+  \item Argo CD Applications sync, prune, and self-heal.
+  \item Promote the \emph{same} image through environments via pull requests.
+\end{itemize}
+\end{recap}

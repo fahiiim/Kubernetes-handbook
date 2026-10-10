@@ -1,0 +1,1411 @@
+\kchapter{Capstone, Part 2: DevOps for TaskFlow on Kubernetes}{k8s-logo}
+\label{ch:capstone-devops}
+
+\begin{objectives}
+\begin{itemize}
+  \item create a multi-node, multi-``zone'' cluster and install platform add-ons;
+  \item write production-grade manifests: StatefulSet, Deployments, Services,
+        Gateway, HPA, PDBs, NetworkPolicies, Pod Security;
+  \item manage environments with Kustomize overlays (and optionally Helm);
+  \item test rolling updates, rollbacks, self-healing, persistence, and autoscaling;
+  \item add monitoring and alerts with Prometheus and Grafana;
+  \item build a CI pipeline and deliver with GitOps through Argo CD.
+\end{itemize}
+\end{objectives}
+
+\section{The road map}
+
+\begin{center}
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  st/.style={regular polygon, regular polygon sides=7, fill=#1, text=white,
+             minimum size=1.75cm, inner sep=0pt, font=\large\bfseries},
+  lb/.style={font=\scriptsize\bfseries, text=k8snavy, align=center, text width=2.1cm}]
+  \foreach \n/\lbl/\col in {1/Cluster \&\\add-ons/k8sblue, 2/Images/k8sblue,
+       3/Manifests/k8sdeep, 4/Overlays/k8sdeep, 5/Deploy \&\\verify/k8sdeep,
+       6/Day-2\\drills/k8snavy, 7/Monitoring/k8sorange, 8/CI/k8sorange, 9/GitOps/k8sorange}{
+    \node[st=\col] (s\n) at (\n*2.3,0) {\n};
+    \node[lb, below=0.12cm of s\n] {\lbl};
+  }
+  \foreach \a/\b in {1/2,2/3,3/4,4/5,5/6,6/7,7/8,8/9}
+    \draw[-{Stealth[length=2.5mm]}, thick, k8smid] (s\a) -- (s\b);
+\end{tikzpicture}}
+\end{center}
+
+\begin{warningbox}
+Before you start, \textbf{replace \kc{your-github-user} everywhere} in the
+repository with your GitHub user name in lower case (one search-and-replace in
+your editor). On Windows, run the commands in \textbf{Git Bash} or \textbf{WSL}:
+they use bash syntax.
+\end{warningbox}
+
+\section{Step 1 --- Cluster and platform add-ons}
+
+\subsection{A three-node cluster with two ``zones''}
+
+We label the two workers with different zones so topology spreading has
+something to spread across.
+
+\begin{yamlcode}{deploy/kind-cluster.yaml}
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: taskflow
+nodes:
+  - role: control-plane
+  - role: worker
+    labels:
+      topology.kubernetes.io/zone: zone-a
+  - role: worker
+    labels:
+      topology.kubernetes.io/zone: zone-b
+\end{yamlcode}
+
+\begin{bashcode}{terminal}
+kind create cluster --config deploy/kind-cluster.yaml
+kubectl get nodes -L topology.kubernetes.io/zone
+\end{bashcode}
+
+\subsection{metrics-server (for \kc{kubectl top} and the HPA)}
+
+\begin{bashcode}{terminal}
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+kubectl -n kube-system patch deployment metrics-server --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+kubectl -n kube-system rollout status deployment/metrics-server
+\end{bashcode}
+
+\subsection{Envoy Gateway (Gateway API implementation)}
+
+The Helm chart installs the Gateway API CRDs and the Envoy Gateway controller.
+Then we declare a \kc{GatewayClass} named \kc{eg} that points to it.
+
+\begin{bashcode}{terminal}
+helm install eg oci://docker.io/envoyproxy/gateway-helm --version v1.5.0 \
+  -n envoy-gateway-system --create-namespace --wait
+kubectl apply -f deploy/gatewayclass.yaml
+kubectl get gatewayclass          # ACCEPTED should become True
+\end{bashcode}
+
+\begin{yamlcode}{deploy/gatewayclass.yaml}
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: eg
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+\end{yamlcode}
+
+\section{Step 2 --- Build images and load them into kind}
+
+kind nodes cannot see your local Docker images, so we \emph{load} them in. (Later,
+CI pushes to GHCR and the cluster pulls from there.)
+
+\begin{bashcode}{terminal}
+docker build -t ghcr.io/your-github-user/taskflow-api:0.1.0 --build-arg APP_VERSION=0.1.0 api
+docker build -t ghcr.io/your-github-user/taskflow-web:0.1.0 web
+kind load docker-image --name taskflow \
+  ghcr.io/your-github-user/taskflow-api:0.1.0 \
+  ghcr.io/your-github-user/taskflow-web:0.1.0
+\end{bashcode}
+
+\section{Step 3 --- The base manifests}
+
+Everything in \kc{k8s/base} is environment-neutral: no namespace, no secrets, no
+environment-specific sizes. Overlays add those in Step 4.
+
+\subsection{PostgreSQL: StatefulSet + headless Service}
+
+\begin{yamlcode}{k8s/base/postgres.yaml}
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/name: postgres
+spec:
+  clusterIP: None                       # headless: stable DNS for postgres-0
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/component: database
+    spec:
+      securityContext:                  # satisfies the "restricted" Pod Security profile
+        runAsNonRoot: true
+        runAsUser: 70                   # the postgres user in the alpine image
+        runAsGroup: 70
+        fsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: taskflow
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef: { name: taskflow-db, key: username }
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: taskflow-db, key: password }
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", 'pg_isready -U "$POSTGRES_USER" -d taskflow']
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", 'pg_isready -U "$POSTGRES_USER" -d taskflow']
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits:   { memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+\end{yamlcode}
+
+\subsection{The API: ServiceAccount, Deployment, Service}
+
+\begin{yamlcode}{k8s/base/api.yaml}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api
+automountServiceAccountToken: false     # the API never calls Kubernetes
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/component: backend
+spec:
+  # no "replicas": the HorizontalPodAutoscaler owns the count
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0                 # zero-downtime rollouts
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: api
+        app.kubernetes.io/component: backend
+    spec:
+      serviceAccountName: api
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: api
+      containers:
+        - name: api
+          image: ghcr.io/your-github-user/taskflow-api:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: taskflow-config
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef: { name: taskflow-db, key: username }
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: taskflow-db, key: password }
+            - name: DATABASE_URL         # $(VAR) expands variables defined above
+              value: postgresql://$(DB_USER):$(DB_PASSWORD)@postgres:5432/taskflow
+          startupProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: http }
+            periodSeconds: 5
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]  # let endpoints update before SIGTERM
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: api
+spec:
+  selector:
+    app.kubernetes.io/name: api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+\end{yamlcode}
+
+\begin{warningbox}
+Because the password is placed into a URL, keep it URL-safe (letters, digits,
+\kc{-} and \kc{\_}). Otherwise pass host, user, and password as separate
+variables and build the connection string in code.
+\end{warningbox}
+
+\subsection{The web frontend}
+
+\begin{yamlcode}{k8s/base/web.yaml}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    app.kubernetes.io/name: web
+    app.kubernetes.io/component: frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: web
+        app.kubernetes.io/component: frontend
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web
+          image: ghcr.io/your-github-user/taskflow-web:0.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet: { path: /, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /, port: http }
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits:   { memory: 64Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp                   # nginx writes its pid and temp files here
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  labels:
+    app.kubernetes.io/name: web
+spec:
+  selector:
+    app.kubernetes.io/name: web
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+\end{yamlcode}
+
+\subsection{Gateway and routes}
+
+\begin{yamlcode}{k8s/base/gateway.yaml}
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: taskflow-gateway
+spec:
+  gatewayClassName: eg
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: taskflow
+spec:
+  parentRefs:
+    - name: taskflow-gateway
+  rules:
+    - matches:
+        - path: { type: PathPrefix, value: /api }
+      backendRefs:
+        - name: api
+          port: 80
+    - matches:
+        - path: { type: PathPrefix, value: / }
+      backendRefs:
+        - name: web
+          port: 80
+\end{yamlcode}
+
+\subsection{Autoscaling and disruption budgets}
+
+\begin{yamlcode}{k8s/base/autoscaling.yaml}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 120
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: web
+\end{yamlcode}
+
+\subsection{Network policies: zero trust inside the namespace}
+
+\begin{center}
+\resizebox{0.9\linewidth}{!}{%
+\begin{tikzpicture}[
+  n/.style={draw=k8sblue, fill=white, rounded corners=4pt, line width=1pt,
+            minimum width=2.6cm, minimum height=1cm, font=\small\bfseries, text=k8snavy, align=center},
+  ok/.style={->, >={Stealth[length=2.5mm]}, line width=1.3pt, k8sgreen},
+  no/.style={->, >={Stealth[length=2.5mm]}, line width=1.1pt, k8sred, dashed}]
+  \node[n, draw=k8sorange] (gw) at (0,0) {Envoy\\[-2pt]\scriptsize\mdseries envoy-gateway-system};
+  \node[n] (web) at (4.5,1.3) {web};
+  \node[n] (api) at (4.5,-1.3) {api};
+  \node[n] (db)  at (9,-1.3) {postgres};
+  \node[n, draw=k8sorange] (prom) at (0,-3) {Prometheus\\[-2pt]\scriptsize\mdseries monitoring};
+  \draw[ok] (gw) -- node[above, sloped, font=\scriptsize]{8080} (web);
+  \draw[ok] (gw) -- node[below, sloped, font=\scriptsize]{8000} (api);
+  \draw[ok] (api) -- node[above, font=\scriptsize]{5432} (db);
+  \draw[ok] (prom) -- node[below, sloped, font=\scriptsize]{8000 /metrics} (api);
+  \draw[no] (web) -- node[right, font=\scriptsize]{\faBan} (api);
+  \draw[no] (web.east) -| node[pos=0.25, above, font=\scriptsize]{\faBan\ blocked} (db.north);
+\end{tikzpicture}}
+\end{center}
+
+\begin{yamlcode}{k8s/base/network-policies.yaml}
+# 1. Deny everything in and out of every Pod in this namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# 2. Everyone may resolve DNS
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+---
+# 3. The gateway may reach the web Pods
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-from-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: web
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: envoy-gateway-system
+      ports:
+        - { port: 8080, protocol: TCP }
+---
+# 4. The gateway and Prometheus may reach the API
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: envoy-gateway-system
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - { port: 8000, protocol: TCP }
+---
+# 5. The API may reach Postgres ...
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-egress-to-postgres
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - { port: 5432, protocol: TCP }
+---
+# 6. ... and Postgres accepts only the API
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-from-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: api
+      ports:
+        - { port: 5432, protocol: TCP }
+\end{yamlcode}
+
+\begin{deepdive}
+Recent kind releases enforce NetworkPolicies through their default CNI
+(kindnet). If you use an older kind version or another local cluster whose CNI
+ignores policies, install Calico or Cilium to see the drills in Step 6 behave
+as described.
+\end{deepdive}
+
+\subsection{The base kustomization}
+
+\begin{yamlcode}{k8s/base/kustomization.yaml}
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - postgres.yaml
+  - api.yaml
+  - web.yaml
+  - gateway.yaml
+  - autoscaling.yaml
+  - network-policies.yaml
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: taskflow
+    includeSelectors: false
+configMapGenerator:
+  - name: taskflow-config
+    literals:
+      - LOG_LEVEL=info
+\end{yamlcode}
+
+\section{Step 4 --- Environment overlays}
+
+\subsection{Development}
+
+\begin{yamlcode}{k8s/overlays/dev/namespace.yaml}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: taskflow-dev
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted
+\end{yamlcode}
+
+\begin{yamlcode}{k8s/overlays/dev/kustomization.yaml}
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: taskflow-dev
+resources:
+  - namespace.yaml
+  - ../../base
+images:
+  - name: ghcr.io/your-github-user/taskflow-api
+    newTag: "0.1.0"
+  - name: ghcr.io/your-github-user/taskflow-web
+    newTag: "0.1.0"
+configMapGenerator:
+  - name: taskflow-config
+    behavior: merge
+    literals:
+      - LOG_LEVEL=debug
+secretGenerator:                       # acceptable ONLY for a local lab
+  - name: taskflow-db
+    literals:
+      - username=taskflow
+      - password=dev-only-password-change-me
+\end{yamlcode}
+
+\subsection{Production}
+
+Production differs in four ways: its own namespace, pinned release tags, bigger
+sizes, and a real secret manager instead of a literal password.
+
+\begin{yamlcode}{k8s/overlays/prod/kustomization.yaml}
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: taskflow-prod
+resources:
+  - namespace.yaml                     # same as dev, with name taskflow-prod
+  - db-external-secret.yaml
+  - ../../base
+images:
+  - name: ghcr.io/your-github-user/taskflow-api
+    newTag: "1.0.0"
+  - name: ghcr.io/your-github-user/taskflow-web
+    newTag: "1.0.0"
+patches:
+  - path: production-patch.yaml
+configMapGenerator:
+  - name: taskflow-config
+    behavior: merge
+    literals:
+      - LOG_LEVEL=warn
+\end{yamlcode}
+
+\begin{yamlcode}{k8s/overlays/prod/production-patch.yaml}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+spec:
+  minReplicas: 3
+  maxReplicas: 20
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits:   { memory: 512Mi }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  replicas: 3
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: retain-ssd   # a Retain class, so data survives mistakes
+        resources:
+          requests:
+            storage: 50Gi
+\end{yamlcode}
+
+\begin{yamlcode}{k8s/overlays/prod/db-external-secret.yaml}
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: taskflow-db
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: company-vault
+  target:
+    name: taskflow-db                  # creates the Secret the base expects
+  data:
+    - secretKey: username
+      remoteRef: { key: prod/taskflow/db, property: username }
+    - secretKey: password
+      remoteRef: { key: prod/taskflow/db, property: password }
+\end{yamlcode}
+
+\begin{protip}
+For a real production database, swap the StatefulSet for a
+\textbf{CloudNativePG} \kc{Cluster} (Chapter 19) or a managed database service,
+and point \kc{DATABASE\_URL} at it. The rest of TaskFlow does not change at all.
+\end{protip}
+
+Always inspect what an overlay renders before applying it:
+
+\begin{bashcode}{terminal}
+kubectl kustomize k8s/overlays/dev | less
+kubectl kustomize k8s/overlays/prod | grep -A2 "image:"
+\end{bashcode}
+
+\section{Step 5 --- Deploy and verify}
+
+\begin{bashcode}{terminal}
+kubectl apply -k k8s/overlays/dev
+
+kubectl -n taskflow-dev rollout status statefulset/postgres --timeout=180s
+kubectl -n taskflow-dev rollout status deployment/api --timeout=180s
+kubectl -n taskflow-dev rollout status deployment/web --timeout=180s
+
+kubectl -n taskflow-dev get all,pvc,gateway,httproute,networkpolicy,hpa,pdb
+\end{bashcode}
+
+Expected (abridged):
+
+\begin{plaincode}{output}
+NAME                       READY   STATUS    RESTARTS   AGE
+pod/api-6f7c9d8b5-4kq2z    1/1     Running   0          60s
+pod/api-6f7c9d8b5-p8xwm    1/1     Running   0          45s
+pod/postgres-0             1/1     Running   0          60s
+pod/web-7d5b8c6f9-9tq7r    1/1     Running   0          60s
+pod/web-7d5b8c6f9-h2m4c    1/1     Running   0          60s
+
+NAME                                          REFERENCE        TARGETS       MINPODS   MAXPODS   REPLICAS
+horizontalpodautoscaler.autoscaling/api       Deployment/api   cpu: 3%/70%   2         6         2
+
+NAME                                                 CLASS   ADDRESS   PROGRAMMED
+gateway.gateway.networking.k8s.io/taskflow-gateway   eg                True
+\end{plaincode}
+
+\subsection{Open the application}
+
+Envoy Gateway creates a Service for our Gateway in its own namespace. On a
+cloud cluster it would get a public IP; locally we port-forward to it:
+
+\begin{bashcode}{terminal}
+export ENVOY_SERVICE=$(kubectl get svc -n envoy-gateway-system \
+  --selector=gateway.envoyproxy.io/owning-gateway-namespace=taskflow-dev,gateway.envoyproxy.io/owning-gateway-name=taskflow-gateway \
+  -o jsonpath='{.items[0].metadata.name}')
+kubectl -n envoy-gateway-system port-forward service/${ENVOY_SERVICE} 8888:80 &
+
+curl -s localhost:8888/api/info                 # {"service":"taskflow-api","version":"0.1.0","pod":"api-..."}
+curl -s -X POST localhost:8888/api/tasks -H 'Content-Type: application/json' -d '{"title":"Ship TaskFlow"}'
+curl -s localhost:8888/api/tasks
+\end{bashcode}
+
+Now open \url{http://localhost:8888} in your browser. Refresh a few times and
+watch the ``served by Pod'' line change as the Service balances across replicas.
+
+\subsection{The same thing as a script}
+
+\begin{bashcode}{scripts/lab-up.sh}
+#!/usr/bin/env bash
+# Build TaskFlow and deploy it, with all add-ons, to a fresh local kind cluster.
+set -euo pipefail
+TAG="${TAG:-0.1.0}"
+IMG="ghcr.io/your-github-user"
+
+kind create cluster --config deploy/kind-cluster.yaml
+
+docker build -t "$IMG/taskflow-api:$TAG" --build-arg APP_VERSION="$TAG" api
+docker build -t "$IMG/taskflow-web:$TAG" web
+kind load docker-image --name taskflow "$IMG/taskflow-api:$TAG" "$IMG/taskflow-web:$TAG"
+
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+kubectl -n kube-system patch deployment metrics-server --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+
+helm install eg oci://docker.io/envoyproxy/gateway-helm --version v1.5.0 \
+  -n envoy-gateway-system --create-namespace --wait
+kubectl apply -f deploy/gatewayclass.yaml
+
+kubectl apply -k k8s/overlays/dev
+for r in statefulset/postgres deployment/api deployment/web; do
+  kubectl -n taskflow-dev rollout status "$r" --timeout=180s
+done
+echo "TaskFlow is running. Port-forward the gateway as shown in Step 5."
+\end{bashcode}
+
+\begin{bashcode}{scripts/lab-down.sh}
+#!/usr/bin/env bash
+set -euo pipefail
+kind delete cluster --name taskflow
+\end{bashcode}
+
+\section{Step 6 --- Day-2 drills}
+
+This is where Kubernetes earns its keep. Run each drill and \emph{watch} what
+happens; every one exercises a concept from earlier chapters.
+
+\subsection{Drill 1: zero-downtime rolling update}
+
+In one terminal, hammer the API and print only failures:
+
+\begin{bashcode}{terminal 1}
+while true; do
+  curl -s -o /dev/null -w "%{http_code} " localhost:8888/api/info | grep -v 200 || true
+  sleep 0.1
+done
+\end{bashcode}
+
+In another, build version 0.2.0 and roll it out declaratively:
+
+\begin{bashcode}{terminal 2}
+docker build -t ghcr.io/your-github-user/taskflow-api:0.2.0 --build-arg APP_VERSION=0.2.0 api
+kind load docker-image --name taskflow ghcr.io/your-github-user/taskflow-api:0.2.0
+
+cd k8s/overlays/dev && kustomize edit set image ghcr.io/your-github-user/taskflow-api:0.2.0 && cd -
+#   (or edit newTag by hand)
+kubectl apply -k k8s/overlays/dev
+kubectl -n taskflow-dev rollout status deployment/api
+curl -s localhost:8888/api/info                   # "version":"0.2.0"
+\end{bashcode}
+
+Terminal 1 should stay silent: readiness probes, \kc{maxUnavailable: 0}, the
+\kc{preStop} sleep, and graceful shutdown work together so no request fails.
+
+\subsection{Drill 2: rollback}
+
+\begin{bashcode}{terminal}
+kubectl -n taskflow-dev rollout history deployment/api
+kubectl -n taskflow-dev rollout undo deployment/api
+curl -s localhost:8888/api/info                   # back to 0.1.0
+\end{bashcode}
+
+\begin{keyidea}
+\kc{rollout undo} is an emergency brake. Your Git overlay still says 0.2.0, so
+the next \kc{apply} would roll forward again. In the GitOps setup of Step 9,
+you roll back by \emph{reverting the commit} instead --- keeping Git and the
+cluster in agreement.
+\end{keyidea}
+
+\subsection{Drill 3: self-healing}
+
+\begin{bashcode}{terminal}
+kubectl -n taskflow-dev get pods -w &                       # watch in the background
+kubectl -n taskflow-dev delete pod -l app.kubernetes.io/name=api --wait=false
+# New api Pods appear within seconds; the HPA minimum of 2 is restored.
+kill %1                                                     # stop the background watch
+\end{bashcode}
+
+\subsection{Drill 4: data survives Pod loss}
+
+\begin{bashcode}{terminal}
+curl -s -X POST localhost:8888/api/tasks -H 'Content-Type: application/json' -d '{"title":"Survive a restart"}'
+kubectl -n taskflow-dev delete pod postgres-0
+kubectl -n taskflow-dev wait --for=condition=Ready pod/postgres-0 --timeout=120s
+curl -s localhost:8888/api/tasks                  # the task is still there: the PVC was re-attached
+\end{bashcode}
+
+While Postgres restarts, \kc{/readyz} fails, so the API Pods are briefly taken
+out of rotation instead of returning errors --- and they are \emph{not}
+restarted, because liveness does not depend on the database.
+
+\subsection{Drill 5: node maintenance}
+
+\begin{bashcode}{terminal}
+kubectl get pods -n taskflow-dev -o wide          # note which node each Pod is on
+kubectl drain taskflow-worker --ignore-daemonsets --delete-emptydir-data
+# PDBs ensure at least one api and one web Pod stay up while Pods move.
+kubectl get pods -n taskflow-dev -o wide
+kubectl uncordon taskflow-worker
+\end{bashcode}
+
+\begin{warningbox}
+With only one Postgres replica, draining its node causes a short database
+outage --- a PDB cannot prevent that, it can only delay the drain. This is exactly
+why production databases use replicated Operators or managed services.
+\end{warningbox}
+
+\subsection{Drill 6: autoscaling under load}
+
+\begin{bashcode}{terminal 1}
+kubectl -n taskflow-dev get hpa api -w
+\end{bashcode}
+
+\begin{bashcode}{terminal 2}
+# 8 parallel clients, each request burns 200 ms of CPU
+for i in $(seq 8); do
+  ( while true; do curl -s -o /dev/null "localhost:8888/api/work?ms=200"; done ) &
+done
+sleep 180
+kill $(jobs -p)
+\end{bashcode}
+
+Within a minute or two, CPU climbs far above 70\,\% of the 100m request and the
+HPA scales \kc{api} towards 6 replicas. Stop the load and, after the 2-minute
+stabilisation window, it scales back to 2. Run \kc{kubectl top pods -n
+taskflow-dev} to see the numbers yourself.
+
+\subsection{Drill 7: prove the network policies}
+
+\begin{bashcode}{terminal}
+# The API may reach Postgres:
+kubectl -n taskflow-dev exec deploy/api -- \
+  python -c "import socket; socket.create_connection(('postgres', 5432), 3); print('api -> postgres: OPEN')"
+
+# The web Pods may not reach the API or the database:
+kubectl -n taskflow-dev exec deploy/web -- wget -T 3 -qO- http://api/api/info \
+  || echo "web -> api: BLOCKED"
+kubectl -n taskflow-dev exec deploy/web -- nc -z -w 3 postgres 5432 \
+  || echo "web -> postgres: BLOCKED"
+\end{bashcode}
+
+\subsection{Drill 8: Pod Security in action}
+
+\begin{bashcode}{terminal}
+kubectl -n taskflow-dev run rooty --image=nginx:1.27
+# Error from server (Forbidden): pods "rooty" is forbidden: violates PodSecurity "restricted:latest":
+#   allowPrivilegeEscalation != false, unrestricted capabilities, runAsNonRoot != true, seccompProfile ...
+\end{bashcode}
+
+\section{Step 7 --- Monitoring and alerting}
+
+\subsection{Install the monitoring stack}
+
+\begin{bashcode}{terminal}
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+helm install monitoring prometheus-community/kube-prometheus-stack \
+  -n monitoring --create-namespace --wait
+\end{bashcode}
+
+\subsection{Scrape the API and define alerts}
+
+\begin{yamlcode}{deploy/monitoring/servicemonitor.yaml}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: taskflow-api
+  namespace: taskflow-dev
+  labels:
+    release: monitoring              # matched by the chart's default selector
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+\end{yamlcode}
+
+\begin{yamlcode}{deploy/monitoring/alerts.yaml}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: taskflow-alerts
+  namespace: taskflow-dev
+  labels:
+    release: monitoring
+spec:
+  groups:
+    - name: taskflow.rules
+      rules:
+        - alert: TaskFlowAPIDown
+          expr: absent(up{namespace="taskflow-dev", service="api"} == 1)
+          for: 2m
+          labels: { severity: critical }
+          annotations:
+            summary: "No healthy TaskFlow API targets for 2 minutes"
+        - alert: TaskFlowHighErrorRate
+          expr: |
+            sum(rate(http_requests_total{namespace="taskflow-dev", status="5xx"}[5m]))
+              / sum(rate(http_requests_total{namespace="taskflow-dev"}[5m])) > 0.05
+          for: 5m
+          labels: { severity: warning }
+          annotations:
+            summary: "More than 5% of TaskFlow API requests are failing"
+        - alert: TaskFlowSlowRequests
+          expr: |
+            histogram_quantile(0.95,
+              sum by (le) (rate(http_request_duration_seconds_bucket{namespace="taskflow-dev"}[5m]))) > 0.5
+          for: 10m
+          labels: { severity: warning }
+          annotations:
+            summary: "p95 latency above 500 ms"
+        - alert: TaskFlowPodRestarting
+          expr: increase(kube_pod_container_status_restarts_total{namespace="taskflow-dev"}[15m]) > 3
+          labels: { severity: warning }
+          annotations:
+            summary: "{{ $labels.pod }} restarted more than 3 times in 15 minutes"
+\end{yamlcode}
+
+\begin{bashcode}{terminal}
+kubectl apply -f deploy/monitoring/
+
+# Prometheus UI -> Status -> Targets: taskflow-api should be UP
+kubectl -n monitoring port-forward svc/monitoring-kube-prometheus-prometheus 9090:9090 &
+
+# Grafana (user admin)
+kubectl -n monitoring get secret monitoring-grafana -o jsonpath='{.data.admin-password}' | base64 -d; echo
+kubectl -n monitoring port-forward svc/monitoring-grafana 3000:80 &
+\end{bashcode}
+
+In Grafana, open \textbf{Dashboards \faAngleRight\ Kubernetes / Compute
+Resources / Namespace (Pods)} and select \kc{taskflow-dev}. Re-run the load
+drill and watch CPU rise and new Pods appear. Then create a panel with:
+
+\begin{plaincode}{PromQL}
+sum by (pod) (rate(http_requests_total{namespace="taskflow-dev", handler="/api/work"}[1m]))
+\end{plaincode}
+
+You now see requests per second \emph{per Pod} --- the HPA spreading load in real time.
+
+\section{Step 8 --- Continuous Integration}
+
+The pipeline runs on every pull request and every push to \kc{main}:
+
+\begin{center}
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  j/.style={fill=#1, text=white, rounded corners=5pt, minimum width=3.0cm,
+            minimum height=1.25cm, align=center, font=\scriptsize\bfseries},
+  >={Stealth[length=2.6mm]}]
+  \node[j=k8sblue] (t) at (0,0.8)   {\faVial\ test\\[-1pt]\mdseries pytest};
+  \node[j=k8sblue] (v) at (0,-0.8)  {\faCheckDouble\ validate-manifests\\[-1pt]\mdseries kustomize + kubeconform};
+  \node[j=k8sdeep] (b) at (4.4,0)   {\faDocker\ build (api, web)\\[-1pt]\mdseries buildx + Trivy scan + push};
+  \node[j=k8sorange] (p) at (8.8,0) {\faIcon{git-alt}\ promote-dev\\[-1pt]\mdseries commit new tag to Git};
+  \node[j=k8snavy] (a) at (13.2,0)  {\kimg[0.45cm]{argo}\ Argo CD\\[-1pt]\mdseries syncs taskflow-dev};
+  \draw[->, thick] (t.east) -- (b.west); \draw[->, thick] (v.east) -- (b.west);
+  \draw[->, thick] (b) -- (p);
+  \draw[->, thick, dashed] (p) -- node[above, font=\tiny]{git push} (a);
+\end{tikzpicture}}
+\end{center}
+
+\begin{yamlcode}{.github/workflows/ci.yaml}
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "k8s/overlays/**"          # tag bumps made by this pipeline do not re-trigger it
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: api/requirements*.txt
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - run: pytest -q
+
+  validate-manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz
+          sudo mv kubeconform /usr/local/bin/
+      - name: Render and validate every overlay
+        run: |
+          for overlay in k8s/overlays/*; do
+            echo "::group::$overlay"
+            kustomize build "$overlay" | kubeconform -strict -summary \
+              -schema-location default \
+              -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+            echo "::endgroup::"
+          done
+
+  build:
+    needs: [test, validate-manifests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        component: [api, web]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute image name (GHCR needs lower case)
+        run: echo "IMAGE=${REGISTRY}/${GITHUB_REPOSITORY_OWNER,,}/taskflow-${{ matrix.component }}" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.component }}
+          load: true                    # keep it locally so we can scan before pushing
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          build-args: APP_VERSION=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+      - name: Scan image for HIGH/CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push image
+        if: github.event_name == 'push'
+        run: docker push "${IMAGE}:${GITHUB_SHA}"
+
+  promote-dev:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Point the dev overlay at the new images
+        working-directory: k8s/overlays/dev
+        run: |
+          OWNER="${GITHUB_REPOSITORY_OWNER,,}"
+          kustomize edit set image \
+            "ghcr.io/your-github-user/taskflow-api=ghcr.io/${OWNER}/taskflow-api:${GITHUB_SHA}" \
+            "ghcr.io/your-github-user/taskflow-web=ghcr.io/${OWNER}/taskflow-web:${GITHUB_SHA}"
+      - name: Commit and push
+        run: |
+          git config user.name  "taskflow-ci[bot]"
+          git config user.email "taskflow-ci@users.noreply.github.com"
+          git commit -am "deploy(dev): taskflow ${GITHUB_SHA::7}"
+          git push
+\end{yamlcode}
+
+\begin{protip}
+GHCR packages are private by default. Either make the two packages public
+(\emph{Package settings \faAngleRight\ Change visibility}) or create an
+\kc{imagePullSecret} in the namespace and reference it from the ServiceAccounts.
+Also set the SHA as the version: every image is traceable to the exact commit.
+\end{protip}
+
+\section{Step 9 --- GitOps with Argo CD}
+
+\subsection{Install Argo CD}
+
+\begin{bashcode}{terminal}
+kubectl create namespace argocd
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+kubectl -n argocd rollout status deployment/argocd-server
+
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d; echo
+kubectl -n argocd port-forward svc/argocd-server 8443:443 &
+# https://localhost:8443  (user: admin)
+\end{bashcode}
+
+\subsection{Hand TaskFlow over to Argo CD}
+
+\begin{yamlcode}{deploy/argocd/taskflow-dev.yaml}
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: taskflow-dev
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-github-user/taskflow.git
+    targetRevision: main
+    path: k8s/overlays/dev
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: taskflow-dev
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false          # our overlay already defines the Namespace
+\end{yamlcode}
+
+\begin{bashcode}{terminal}
+kubectl apply -f deploy/argocd/taskflow-dev.yaml
+kubectl -n argocd get applications            # SYNC STATUS: Synced, HEALTH: Healthy
+\end{bashcode}
+
+\subsection{The GitOps loop, end to end}
+
+\begin{enumerate}
+  \item Change something visible in \kc{web/index.html} (say, the heading) on a
+        branch and open a pull request. CI runs \emph{test} and
+        \emph{validate-manifests}, and builds and scans the images.
+  \item Merge it. CI pushes images tagged with the commit SHA and commits the
+        new tags to \kc{k8s/overlays/dev}.
+  \item Argo CD notices the commit (within about three minutes, or instantly with
+        a webhook) and performs a rolling update. Refresh the browser: your
+        change is live.
+  \item Something wrong? \kc{git revert} the bot's commit. Argo CD rolls back.
+\end{enumerate}
+
+\begin{tryit}
+Prove self-healing of \emph{configuration}: run
+\kc{kubectl -n taskflow-dev scale deployment web --replicas=0}. Within seconds
+Argo CD detects the drift from Git and restores two replicas. In GitOps,
+\textbf{Git always wins}.
+\end{tryit}
+
+\subsection{Promoting to production}
+
+Production gets its own Application pointing at \kc{k8s/overlays/prod}, usually
+on a separate cluster, \emph{without} automated sync or with a manual approval
+gate. A release is a reviewed pull request that changes \kc{newTag} in the prod
+overlay to an image SHA that has already been running happily in dev.
+
+\section{Optional --- Packaging TaskFlow as a Helm chart}
+
+If you want to share TaskFlow, or let others install it with one command,
+package the same manifests as a chart.
+
+\begin{yamlcode}{charts/taskflow/Chart.yaml}
+apiVersion: v2
+name: taskflow
+description: TaskFlow - the Kubernetes Handbook capstone application
+type: application
+version: 0.1.0           # chart version
+appVersion: "0.1.0"      # default image tag
+\end{yamlcode}
+
+\begin{yamlcode}{charts/taskflow/values.yaml}
+image:
+  registry: ghcr.io/your-github-user
+  tag: ""                # defaults to .Chart.AppVersion
+api:
+  autoscaling: { minReplicas: 2, maxReplicas: 6, targetCPU: 70 }
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { memory: 256Mi }
+web:
+  replicas: 2
+postgres:
+  storage: 2Gi
+  existingSecret: taskflow-db    # created out-of-band (ExternalSecret, Sealed Secret...)
+gateway:
+  className: eg
+logLevel: info
+\end{yamlcode}
+
+\begin{plaincode}{charts/taskflow/templates/api-deployment.yaml (excerpt)}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-api
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: api
+        app.kubernetes.io/instance: {{ .Release.Name }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      containers:
+        - name: api
+          image: "{{ .Values.image.registry }}/taskflow-api:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+          # ... probes, env and securityContext exactly as in k8s/base/api.yaml ...
+\end{plaincode}
+
+\begin{bashcode}{terminal}
+helm lint charts/taskflow
+helm template demo charts/taskflow | less
+helm upgrade --install demo charts/taskflow -n taskflow-helm --create-namespace --atomic --wait
+\end{bashcode}
+
+\section{What you have built}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{4.0cm} L}
+\kheader \kth{Concept (chapter)} & \kth{Where it appears in TaskFlow} \\
+Containers (1) & Multi-stage, non-root images for api and web. \\
+Pods, probes, shutdown (6) & Startup/liveness/readiness probes, \kc{preStop}, graceful \kc{SIGTERM}. \\
+Labels, namespaces (7) & Recommended labels; one namespace per environment. \\
+Deployments (8) & Zero-downtime rolling updates and rollbacks. \\
+StatefulSets (9) & PostgreSQL with its own PVC. \\
+Services, DNS (10) & \kc{api}, \kc{web}, headless \kc{postgres}. \\
+Gateway API, NetworkPolicy (11) & Envoy Gateway routes; default-deny zero-trust policies. \\
+ConfigMaps, Secrets (12) & Generated config; dev secret; ExternalSecret in prod. \\
+Storage (13) & \kc{volumeClaimTemplates}; Retain class in prod. \\
+Resources, scheduling (14) & Requests/limits, topology spread over zones, PDBs. \\
+Autoscaling (15) & HPA on CPU, demonstrated under load. \\
+Security (16) & Restricted Pod Security, non-root, read-only FS, no SA tokens. \\
+Observability (17) & ServiceMonitor, PrometheusRule alerts, Grafana dashboards. \\
+Helm, Kustomize (18) & Base + overlays; optional chart. \\
+CI/CD, GitOps (20) & GitHub Actions + Trivy + Argo CD. \\
+\end{tabularx}
+\end{center}
+
+\section{Where to go next}
+
+\begin{itemize}
+  \item Replace the StatefulSet with a 3-instance \textbf{CloudNativePG} cluster with backups.
+  \item Add \textbf{cert-manager} and an HTTPS listener on the Gateway.
+  \item Do a \textbf{canary release} with weighted \kc{backendRefs} or Argo Rollouts.
+  \item Sign images with \textbf{cosign} in CI and verify them with Kyverno.
+  \item Add \textbf{OpenTelemetry} tracing to the API.
+  \item Deploy the prod overlay to a managed cluster (EKS, GKE, or AKS).
+  \item Prepare for the \textbf{CKAD}, \textbf{CKA}, and \textbf{CKS} certifications.
+\end{itemize}
+
+\begin{bashcode}{terminal}
+# Clean up everything
+kind delete cluster --name taskflow
+\end{bashcode}
+
+\begin{recap}
+\begin{itemize}
+  \item You built a three-tier app and ran it on a secure, observable,
+        autoscaling Kubernetes setup.
+  \item Kustomize overlays separate environments; GitOps keeps them in Git.
+  \item CI tests, validates, scans, publishes, and promotes automatically.
+  \item The drills showed self-healing, zero-downtime updates, rollbacks,
+        persistence, scaling, and isolation --- the reasons Kubernetes exists.
+\end{itemize}
+\end{recap}

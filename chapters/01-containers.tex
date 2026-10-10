@@ -1,0 +1,229 @@
+\kchapter{Before Kubernetes: Applications and Containers}{docker}
+
+\begin{objectives}
+\begin{itemize}
+  \item why ``it works on my machine'' is the oldest problem in software;
+  \item what a container is, and how it differs from a virtual machine;
+  \item the vocabulary: image, container, registry, tag, layer;
+  \item how to write a Dockerfile and build, run, and push an image.
+\end{itemize}
+\end{objectives}
+
+Kubernetes is a system for running \emph{containers}. Before we can understand
+Kubernetes, we need to understand what it is managing. This chapter is your
+crash course.
+
+\section{The problem: ``it works on my machine''}
+
+Imagine you have written a small web API in Python. On your laptop it runs
+perfectly. You copy it to a server and it crashes: the server has a different
+Python version, a missing system library, and a different configuration file.
+A teammate tries it on a Mac and gets a third set of errors.
+
+Every application depends on much more than its own source code:
+
+\begin{itemize}
+  \item a language runtime (Python 3.12, Node 22, Java 21, \ldots);
+  \item libraries and their exact versions;
+  \item operating-system packages (OpenSSL, libpq, fonts, timezone data);
+  \item environment variables and configuration files;
+  \item a particular directory layout and file permissions.
+\end{itemize}
+
+Historically, teams solved this with long installation documents and careful
+manual server setup. That is slow, fragile, and impossible to repeat exactly.
+
+\section{Virtual machines: the first answer}
+
+A \kterm{virtual machine} (VM) emulates a whole computer. You install a full
+operating system inside it, then your application. A VM image can be copied
+anywhere and behaves the same. The cost: every VM carries a complete operating
+system kernel, takes gigabytes of disk, and needs a minute or more to boot.
+
+\section{Containers: a lighter answer}
+
+A \kterm{container} packages an application \emph{together with everything it
+needs to run} --- runtime, libraries, OS packages, config --- but it does
+\emph{not} include its own kernel. All containers on a machine share the host's
+Linux kernel. The kernel uses two features to keep containers apart:
+
+\begin{itemize}
+  \item \kterm{namespaces} give each container its own private view of
+        processes, network interfaces, mount points, and hostnames;
+  \item \kterm{cgroups} (control groups) limit how much CPU, memory, and I/O a
+        container may use.
+\end{itemize}
+
+So a container is really just an ordinary Linux process that has been given
+blinkers (namespaces) and a budget (cgroups).
+
+\begin{center}
+\resizebox{0.92\linewidth}{!}{%
+\begin{tikzpicture}[
+  layer/.style={draw=none, fill=#1, text=white, minimum height=0.8cm,
+                font=\small\bfseries, rounded corners=2pt},
+  app/.style={draw=none, fill=#1, text=white, minimum height=0.8cm,
+              minimum width=1.9cm, font=\footnotesize\bfseries, rounded corners=2pt}]
+  % VMs
+  \node[font=\bfseries, text=k8snavy] at (3.1,5.3) {Virtual Machines};
+  \node[layer=k8sgray, minimum width=6.4cm] at (3.1,0) {Hardware};
+  \node[layer=k8sgray!80, minimum width=6.4cm] at (3.1,0.9) {Hypervisor};
+  \foreach \x/\n in {1.0/A, 3.1/B, 5.2/C}{
+    \node[app=k8sdeep] at (\x,1.8) {Guest OS};
+    \node[app=k8smid, text=k8snavy] at (\x,2.7) {Libs};
+    \node[app=k8sblue] at (\x,3.6) {App \n};
+  }
+  \draw[decorate, decoration={brace, amplitude=6pt, mirror}, k8sgray]
+       (6.45,1.4) -- (6.45,4.0) node[midway, right=8pt, font=\scriptsize, text=k8sgray, align=left]{GBs each,\\minutes to boot};
+  % Containers
+  \node[font=\bfseries, text=k8snavy] at (11.6,5.3) {Containers};
+  \node[layer=k8sgray, minimum width=6.4cm] at (11.6,0) {Hardware};
+  \node[layer=k8sgray!80, minimum width=6.4cm] at (11.6,0.9) {Host OS + shared Linux kernel};
+  \node[layer=k8sdeep, minimum width=6.4cm] at (11.6,1.8) {Container runtime (containerd)};
+  \foreach \x/\n in {9.5/A, 11.6/B, 13.7/C}{
+    \node[app=k8smid, text=k8snavy] at (\x,2.7) {Libs};
+    \node[app=k8sblue] at (\x,3.6) {App \n};
+  }
+  \draw[decorate, decoration={brace, amplitude=6pt, mirror}, k8sgray]
+       (14.95,2.3) -- (14.95,4.0) node[midway, right=8pt, font=\scriptsize, text=k8sgray, align=left]{MBs each,\\start in ms};
+\end{tikzpicture}}
+\end{center}
+
+\begin{analogy}
+A virtual machine is a \emph{detached house}: its own foundations, plumbing and
+roof. A container is an \emph{apartment} in a building: it has its own locked
+front door and furniture, but shares the foundations and plumbing (the kernel)
+with its neighbours. Apartments are cheaper and quicker to build.
+\end{analogy}
+
+\section{The container vocabulary}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{2.8cm} L}
+\kheader \kth{Term} & \kth{Meaning} \\
+Image & A read-only, versioned package of an application and its
+        filesystem. Think of it as a \emph{class} or a \emph{recipe}. \\
+Container & A running instance of an image. Think \emph{object} or
+            \emph{the cooked meal}. Many containers can run from one image. \\
+Layer & Images are built in stacked, cached layers. Changing one line of your
+        Dockerfile only rebuilds the layers after it. \\
+Registry & A server that stores images: Docker Hub, GitHub Container Registry
+           (\kc{ghcr.io}), Amazon ECR, Google Artifact Registry, Harbor\ldots \\
+Tag & A human label for an image version, e.g.\ \kc{nginx:1.27}. \\
+Digest & An immutable content hash, e.g.\ \kc{nginx@sha256:4c0f\ldots}. A
+         tag can be moved; a digest cannot. \\
+Dockerfile & The text recipe used to build an image. \\
+OCI & The Open Container Initiative: the open standard for image and runtime
+      formats. Docker, Podman, containerd, and Kubernetes all speak OCI. \\
+\end{tabularx}
+\end{center}
+
+\section{Your first Dockerfile}
+
+Let us containerise a tiny Python web server. Create a folder with two files.
+
+\begin{pycode}{app.py}
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import os, socket
+
+class Hello(BaseHTTPRequestHandler):
+    def do_GET(self):
+        msg = f"Hello from {socket.gethostname()} (version {os.getenv('VERSION', '1')})\n"
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(msg.encode())
+
+HTTPServer(("0.0.0.0", 8080), Hello).serve_forever()
+\end{pycode}
+
+\begin{dockercode}{Dockerfile}
+# 1. Start from an official, small base image
+FROM python:3.12-slim
+
+# 2. Work inside /app in the image
+WORKDIR /app
+
+# 3. Copy our code into the image
+COPY app.py .
+
+# 4. Run as a non-root user (good security habit)
+RUN useradd --uid 10001 appuser
+USER 10001
+
+# 5. Document the port and define the start command
+EXPOSE 8080
+CMD ["python", "app.py"]
+\end{dockercode}
+
+Now build, run, and test it:
+
+\begin{bashcode}{terminal}
+# Build an image called hello with tag 1.0 from the current folder (.)
+docker build -t hello:1.0 .
+
+# Run it in the background (-d), mapping host port 8080 to container port 8080
+docker run -d --name hello -p 8080:8080 hello:1.0
+
+curl http://localhost:8080
+# Hello from 3f2a9c1b7e44 (version 1)
+
+docker ps            # list running containers
+docker logs hello    # see its output
+docker stop hello && docker rm hello
+\end{bashcode}
+
+\subsection{Pushing to a registry}
+
+Kubernetes nodes pull images from a registry, so images must be pushed
+somewhere the cluster can reach.
+
+\begin{bashcode}{terminal}
+docker login ghcr.io -u YOUR_GITHUB_USER
+docker tag hello:1.0 ghcr.io/YOUR_GITHUB_USER/hello:1.0
+docker push ghcr.io/YOUR_GITHUB_USER/hello:1.0
+\end{bashcode}
+
+\section{Good image habits}
+
+\begin{itemize}
+  \item \textbf{Use small, official base images} (\kc{-slim}, \kc{-alpine},
+        or ``distroless''). Less software means fewer vulnerabilities.
+  \item \textbf{Pin versions.} \kc{python:3.12-slim} is better than
+        \kc{python:latest}; a digest is better still.
+  \item \textbf{Order layers from least to most frequently changed}: install
+        dependencies first, copy source code last, so rebuilds are fast.
+  \item \textbf{Use multi-stage builds} to compile in one stage and copy only
+        the result into a small runtime stage.
+  \item \textbf{Run as non-root.} Kubernetes can enforce this for you later.
+  \item \textbf{One process per container.} Let the platform handle restarts
+        and scaling instead of running a process supervisor inside.
+  \item \textbf{Log to stdout/stderr}, never to files inside the container.
+\end{itemize}
+
+\section{Why containers are not enough}
+
+Containers solve packaging. But once you run real systems, new questions appear:
+
+\begin{itemize}
+  \item You have 40 containers across 10 servers. Which server should a new one go on?
+  \item A server dies at 3 a.m. Who restarts its containers somewhere else?
+  \item Traffic triples on Black Friday. Who starts more copies, and who
+        removes them afterwards?
+  \item How do containers find each other when their IP addresses keep changing?
+  \item How do you roll out version 2 without downtime, and roll back if it is broken?
+  \item Where do passwords and configuration live?
+\end{itemize}
+
+Answering these questions automatically is called \kterm{container
+orchestration}. And the de-facto standard orchestrator is Kubernetes.
+
+\begin{recap}
+\begin{itemize}
+  \item Containers package an app with its dependencies but share the host kernel.
+  \item An \emph{image} is the recipe; a \emph{container} is a running instance.
+  \item Images are built from a Dockerfile and stored in a registry.
+  \item Running many containers reliably across many machines needs an
+        orchestrator --- that is Kubernetes.
+\end{itemize}
+\end{recap}

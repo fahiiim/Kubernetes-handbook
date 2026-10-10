@@ -1,0 +1,83 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\@writefile{toc}{\contentsline {chapter}{\numberline {23}Capstone, Part 2: DevOps for TaskFlow on Kubernetes}{122}{chapter.23}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\newlabel{ch:capstone-devops}{{23}{122}{Capstone, Part 2: DevOps for TaskFlow on Kubernetes}{chapter.23}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {23.1}The road map}{122}{section.23.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {23.2}Step 1 --- Cluster and platform add-ons}{122}{section.23.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.2.1}A three-node cluster with two ``zones''}{122}{subsection.23.2.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.2.2}metrics-server (for \textcolor {k8sdeep}{\texttt  {kubectl top}} and the HPA)}{123}{subsection.23.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.2.3}Envoy Gateway (Gateway API implementation)}{123}{subsection.23.2.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {23.3}Step 2 --- Build images and load them into kind}{123}{section.23.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {23.4}Step 3 --- The base manifests}{124}{section.23.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.4.1}PostgreSQL: StatefulSet + headless Service}{124}{subsection.23.4.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.4.2}The API: ServiceAccount, Deployment, Service}{126}{subsection.23.4.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.4.3}The web frontend}{128}{subsection.23.4.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.4.4}Gateway and routes}{129}{subsection.23.4.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.4.5}Autoscaling and disruption budgets}{130}{subsection.23.4.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.4.6}Network policies: zero trust inside the namespace}{131}{subsection.23.4.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.4.7}The base kustomization}{133}{subsection.23.4.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {23.5}Step 4 --- Environment overlays}{133}{section.23.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.5.1}Development}{133}{subsection.23.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.5.2}Production}{134}{subsection.23.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {23.6}Step 5 --- Deploy and verify}{136}{section.23.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.6.1}Open the application}{137}{subsection.23.6.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.6.2}The same thing as a script}{137}{subsection.23.6.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {23.7}Step 6 --- Day-2 drills}{138}{section.23.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.7.1}Drill 1: zero-downtime rolling update}{138}{subsection.23.7.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.7.2}Drill 2: rollback}{138}{subsection.23.7.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.7.3}Drill 3: self-healing}{139}{subsection.23.7.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.7.4}Drill 4: data survives Pod loss}{139}{subsection.23.7.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.7.5}Drill 5: node maintenance}{139}{subsection.23.7.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.7.6}Drill 6: autoscaling under load}{139}{subsection.23.7.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.7.7}Drill 7: prove the network policies}{140}{subsection.23.7.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.7.8}Drill 8: Pod Security in action}{140}{subsection.23.7.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {23.8}Step 7 --- Monitoring and alerting}{140}{section.23.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.8.1}Install the monitoring stack}{140}{subsection.23.8.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.8.2}Scrape the API and define alerts}{141}{subsection.23.8.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {23.9}Step 8 --- Continuous Integration}{142}{section.23.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {23.10}Step 9 --- GitOps with Argo CD}{144}{section.23.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.10.1}Install Argo CD}{145}{subsection.23.10.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.10.2}Hand TaskFlow over to Argo CD}{145}{subsection.23.10.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.10.3}The GitOps loop, end to end}{145}{subsection.23.10.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {23.10.4}Promoting to production}{146}{subsection.23.10.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {23.11}Optional --- Packaging TaskFlow as a Helm chart}{146}{section.23.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {23.12}What you have built}{148}{section.23.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {23.13}Where to go next}{148}{section.23.13}\protected@file@percent }
+\@setckpt{chapters/23-capstone-devops}{
+\setcounter{page}{150}
+\setcounter{equation}{0}
+\setcounter{enumi}{4}
+\setcounter{enumii}{0}
+\setcounter{enumiii}{0}
+\setcounter{enumiv}{0}
+\setcounter{footnote}{0}
+\setcounter{mpfootnote}{0}
+\setcounter{part}{7}
+\setcounter{chapter}{23}
+\setcounter{section}{13}
+\setcounter{subsection}{0}
+\setcounter{subsubsection}{0}
+\setcounter{paragraph}{0}
+\setcounter{subparagraph}{0}
+\setcounter{figure}{0}
+\setcounter{table}{0}
+\setcounter{parentequation}{0}
+\setcounter{LT@tables}{0}
+\setcounter{LT@chunks}{0}
+\setcounter{lstnumber}{3}
+\setcounter{tcbbreakpart}{1}
+\setcounter{tcblayer}{0}
+\setcounter{tcolorbox@number}{346}
+\setcounter{tcbrastercolumn}{1}
+\setcounter{tcbrasterrow}{1}
+\setcounter{tcbrasternum}{1}
+\setcounter{tcbraster}{0}
+\setcounter{tcblisting}{185}
+\setcounter{section@level}{0}
+\setcounter{Item}{34}
+\setcounter{Hfootnote}{0}
+\setcounter{bookmark@seq@number}{176}
+\setcounter{lstlisting}{0}
+}

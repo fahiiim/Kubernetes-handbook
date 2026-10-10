@@ -1,0 +1,138 @@
+\kchapter{Glossary and Learning Path}{k8s-logo}
+
+\section{Glossary}
+
+\begin{description}[style=nextline, leftmargin=1.2em, itemsep=0.35em, font=\color{k8sblue}\bfseries]
+  \item[Admission controller] Code in the API server that can modify or reject
+        requests after authentication and authorisation (e.g.\ Pod Security,
+        ValidatingAdmissionPolicy).
+  \item[Annotation] Non-identifying key/value metadata used by tools and humans.
+  \item[API server] The control-plane component that serves the Kubernetes API;
+        the only component that talks to etcd.
+  \item[CNI] Container Network Interface: the plugin standard for Pod networking.
+  \item[ConfigMap] An object holding non-secret configuration data.
+  \item[Container runtime] Software that runs containers on a node (containerd, CRI-O).
+  \item[Context] A kubeconfig entry combining a cluster, a user, and a default namespace.
+  \item[Controller] A loop that watches objects and reconciles actual state
+        toward desired state.
+  \item[CRD] CustomResourceDefinition: adds a new resource type to the API.
+  \item[CronJob] Creates Jobs on a schedule.
+  \item[CSI] Container Storage Interface: the plugin standard for storage.
+  \item[DaemonSet] Runs one Pod per (selected) node.
+  \item[Deployment] Manages ReplicaSets to run and update stateless Pods.
+  \item[Desired state] What you declared in an object's \kc{spec}.
+  \item[EndpointSlice] The list of Pod IPs/ports currently backing a Service.
+  \item[etcd] The consistent key--value store holding all cluster state.
+  \item[Gateway API] The modern, role-oriented API for L4/L7 traffic routing
+        (GatewayClass, Gateway, HTTPRoute\ldots).
+  \item[GitOps] Operating model in which Git holds desired state and an in-cluster
+        agent continuously applies it.
+  \item[Helm] The Kubernetes package manager; packages are called charts.
+  \item[HPA] HorizontalPodAutoscaler: scales the number of replicas on metrics.
+  \item[Ingress] The original API for HTTP routing into the cluster.
+  \item[Init container] A container that runs to completion before the app containers start.
+  \item[Job] Runs Pods until a number of them complete successfully.
+  \item[kubeconfig] The file \kc{kubectl} uses to find clusters and credentials.
+  \item[kubelet] The node agent that runs Pods and reports their status.
+  \item[kube-proxy] Programs node networking so Service virtual IPs reach Pods.
+  \item[Kustomize] Template-free customisation of YAML through bases and overlays.
+  \item[Label / selector] Identifying key/value pairs, and queries over them.
+  \item[LimitRange] Per-namespace defaults and bounds for container resources.
+  \item[Liveness probe] Health check whose failure restarts the container.
+  \item[Namespace] A virtual partition of a cluster for names, RBAC, and quotas.
+  \item[NetworkPolicy] Allow-list rules for Pod network traffic.
+  \item[Node] A worker machine (VM or physical) in the cluster.
+  \item[Operator] A controller that encodes operational expertise for specific software.
+  \item[PDB] PodDisruptionBudget: limits voluntary disruptions of an app.
+  \item[Pod] The smallest deployable unit: one or more containers sharing network and storage.
+  \item[PV / PVC] PersistentVolume (actual storage) / PersistentVolumeClaim (a request for it).
+  \item[QoS class] Guaranteed, Burstable, or BestEffort --- derived from requests and limits.
+  \item[RBAC] Role-Based Access Control: Roles/ClusterRoles bound to subjects.
+  \item[Readiness probe] Health check whose failure removes the Pod from Service endpoints.
+  \item[ReplicaSet] Keeps a fixed number of identical Pods running.
+  \item[Request / limit] Guaranteed / maximum amount of CPU or memory for a container.
+  \item[ResourceQuota] A per-namespace cap on total resource consumption.
+  \item[Scheduler] Assigns unscheduled Pods to nodes.
+  \item[Secret] An object holding sensitive data (base64-encoded, not encrypted by default).
+  \item[Service] A stable virtual IP and DNS name that load-balances to selected Pods.
+  \item[ServiceAccount] An identity for processes running in Pods.
+  \item[Sidecar] A helper container that runs alongside the main container for its whole life.
+  \item[StatefulSet] Runs Pods with stable identities and per-Pod storage.
+  \item[StorageClass] Describes a type of storage and enables dynamic provisioning.
+  \item[Taint / toleration] Node-side repulsion and the Pod-side permission to ignore it.
+\end{description}
+
+\section{Your learning path}
+
+\begin{center}
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  lvl/.style={draw=#1, fill=#1!8, rounded corners=6pt, line width=1pt,
+              text width=4.5cm, minimum height=4.6cm, align=left, font=\footnotesize, text=k8snavy},
+  hd/.style={fill=#1, text=white, rounded corners=4pt, font=\small\bfseries,
+             minimum width=4.9cm, minimum height=0.8cm}]
+  \node[lvl=k8sblue] (l1) at (0,0) {\begin{itemize}[leftmargin=1em]
+        \item Containers \& Docker
+        \item Pods, Deployments, Services
+        \item ConfigMaps, Secrets
+        \item kubectl fluency
+        \item \textbf{Goal}: deploy an app with a Service
+        \end{itemize}};
+  \node[hd=k8sblue, anchor=south] at (l1.north) {\faSeedling\ \ Beginner};
+  \node[lvl=k8sdeep] (l2) at (5.4,0) {\begin{itemize}[leftmargin=1em]
+        \item Probes, resources, HPA
+        \item StatefulSets, storage
+        \item Gateway API, NetworkPolicy
+        \item Helm, Kustomize
+        \item \textbf{Cert}: CKAD
+        \end{itemize}};
+  \node[hd=k8sdeep, anchor=south] at (l2.north) {\faTree\ \ Intermediate};
+  \node[lvl=k8snavy] (l3) at (10.8,0) {\begin{itemize}[leftmargin=1em]
+        \item Cluster operations, upgrades
+        \item RBAC, Pod Security, policy
+        \item Observability, SLOs
+        \item GitOps, CI/CD
+        \item \textbf{Certs}: CKA, CKS
+        \end{itemize}};
+  \node[hd=k8snavy, anchor=south] at (l3.north) {\faMountain\ \ Advanced};
+  \node[lvl=k8sorange] (l4) at (16.2,0) {\begin{itemize}[leftmargin=1em]
+        \item Operators \& controllers
+        \item Multi-cluster, service mesh
+        \item Platform engineering
+        \item Cost \& capacity
+        \item \textbf{Path}: Kubestronaut
+        \end{itemize}};
+  \node[hd=k8sorange, anchor=south] at (l4.north) {\faRocket\ \ Expert};
+\end{tikzpicture}}
+\end{center}
+
+\section{Certifications}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{2.0cm} L L}
+\kheader \kth{Exam} & \kth{Focus} & \kth{Good preparation} \\
+\textbf{KCNA} & Cloud-native fundamentals (multiple choice). & Parts I--III of this book. \\
+\textbf{CKAD} & Building and running applications (hands-on). & Parts II--IV, and the capstone. \\
+\textbf{CKA} & Administering clusters (hands-on). & Parts I, V, VI; kubeadm practice. \\
+\textbf{CKS} & Securing clusters and workloads (hands-on, requires CKA). & Chapter 16 in depth, Falco, supply chain. \\
+\end{tabularx}
+\end{center}
+
+\section{Where to keep learning}
+
+\begin{itemize}
+  \item \textbf{Official documentation}: \url{https://kubernetes.io/docs/} --- the tasks and tutorials sections especially.
+  \item \textbf{Kubernetes the Hard Way} (Kelsey Hightower): build a cluster by hand to understand every component.
+  \item \textbf{Gateway API docs}: \url{https://gateway-api.sigs.k8s.io/}.
+  \item \textbf{CNCF Landscape}: \url{https://landscape.cncf.io/} --- the map of the ecosystem.
+  \item \textbf{KubeCon talks} on YouTube --- real-world experience from people running Kubernetes at scale.
+  \item \textbf{Play}: break your kind cluster on purpose, then fix it. That is how experts are made.
+\end{itemize}
+
+\vfill
+\begin{center}
+\kimg[2.2cm]{k8s-logo}\\[0.8em]
+{\Large\bfseries\color{k8sblue} Happy sailing, helmsman.}\\[0.3em]
+{\small\color{k8sgray} You now know how to steer.}
+\end{center}

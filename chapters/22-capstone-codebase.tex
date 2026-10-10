@@ -1,0 +1,532 @@
+\kchapter{Capstone, Part 1: The TaskFlow Codebase}{deploy}
+\label{ch:capstone-code}
+
+\begin{objectives}
+\begin{itemize}
+  \item what we are building and how its pieces fit together;
+  \item the full repository layout;
+  \item the complete source code of the API and the web frontend;
+  \item production-quality Dockerfiles for both services;
+  \item how to run the API locally before Kubernetes enters the picture.
+\end{itemize}
+\end{objectives}
+
+\section{What we are building}
+
+\textbf{TaskFlow} is a small to-do application. It is deliberately simple in
+\emph{features} but realistic in \emph{shape}: a static web frontend, a Python
+REST API, and a PostgreSQL database. That three-tier shape is the same one you
+will meet in most real companies, so everything you do here transfers directly.
+
+\begin{center}
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  svc/.style={draw=k8sblue, fill=white, line width=1pt, rounded corners=5pt,
+              minimum width=3.0cm, minimum height=1.9cm, align=center,
+              font=\scriptsize\bfseries, text=k8snavy},
+  >={Stealth[length=2.6mm]}]
+  % outside
+  \node[font=\Huge, text=k8snavy] (user) at (-1.2,0) {\faUserCircle};
+  \node[font=\scriptsize\bfseries, below=0pt of user, text=k8snavy] {browser};
+  % gateway
+  \node[svc, fill=k8sorange!10, draw=k8sorange] (gw) at (2.6,0)
+       {\kimg[0.7cm]{ing}\\Envoy Gateway\\[-1pt]\mdseries Gateway + HTTPRoute};
+  % web/api
+  \node[svc] (web) at (7.0,1.6) {\kimg[0.7cm]{deploy}\\web (nginx)\\[-1pt]\mdseries Deployment x2};
+  \node[svc] (api) at (7.0,-1.6) {\kimg[0.7cm]{deploy}\\api (FastAPI)\\[-1pt]\mdseries Deployment 2--6, HPA};
+  \node[svc] (db)  at (11.4,-1.6) {\kimg[0.7cm]{sts}\\postgres\\[-1pt]\mdseries StatefulSet + PVC};
+  \node[svc, draw=k8sgray] (cfg) at (11.4,1.6) {\kimg[0.55cm]{cm}\kimg[0.55cm]{secret}\\ConfigMap + Secret};
+  \node[svc, draw=k8sorange, fill=k8sorange!8] (prom) at (7.0,-4.6) {\kimg[0.7cm]{prometheus}\\Prometheus\\[-1pt]\mdseries + Grafana};
+  \draw[->, line width=1.3pt, k8sorange] (user) -- node[above, font=\tiny]{HTTP} (gw);
+  \draw[->, thick, k8sblue] (gw) -- node[above, sloped, font=\tiny]{/} (web);
+  \draw[->, thick, k8sblue] (gw) -- node[below, sloped, font=\tiny]{/api} (api);
+  \draw[->, thick, k8sblue] (api) -- node[above, font=\tiny]{5432} (db);
+  \draw[->, thick, k8sgray, dashed] (cfg) -- (api);
+  \draw[->, thick, k8sorange, dashed] (prom) -- node[right, font=\tiny]{scrape /metrics} (api);
+  \begin{scope}[on background layer]
+    \node[fill=k8slight, draw=k8sblue, dashed, rounded corners=10pt, inner sep=0.35cm,
+          fit=(web)(api)(db)(cfg), label={[font=\small\bfseries, text=k8sblue]above:\faCubes\ \ namespace taskflow-dev}] {};
+  \end{scope}
+\end{tikzpicture}}
+\end{center}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{2.4cm} P{3.4cm} L}
+\kheader \kth{Component} & \kth{Technology} & \kth{Responsibility} \\
+\textbf{web} & HTML + JavaScript on unprivileged nginx & Serves the single-page UI. \\
+\textbf{api} & Python 3.12, FastAPI, psycopg 3 & REST endpoints, health checks, Prometheus metrics. \\
+\textbf{postgres} & PostgreSQL 16 & Stores tasks on a persistent volume. \\
+\textbf{gateway} & Envoy Gateway (Gateway API) & Routes \kc{/} to web and \kc{/api} to the API. \\
+\end{tabularx}
+\end{center}
+
+\section{Repository layout}
+
+\begin{plaincode}{taskflow/}
+taskflow/
+  api/                          # Python backend
+    main.py
+    requirements.txt
+    requirements-dev.txt
+    pytest.ini
+    tests/
+      test_api.py
+    Dockerfile
+    .dockerignore
+  web/                          # static frontend
+    index.html
+    Dockerfile
+  k8s/                          # Kubernetes manifests (Kustomize)
+    base/
+      kustomization.yaml
+      postgres.yaml
+      api.yaml
+      web.yaml
+      gateway.yaml
+      autoscaling.yaml
+      network-policies.yaml
+    overlays/
+      dev/
+        kustomization.yaml
+        namespace.yaml
+      prod/
+        kustomization.yaml
+        namespace.yaml
+        production-patch.yaml
+        db-external-secret.yaml
+  deploy/                       # cluster-level and platform config
+    kind-cluster.yaml
+    gatewayclass.yaml
+    monitoring/
+      servicemonitor.yaml
+      alerts.yaml
+    argocd/
+      taskflow-dev.yaml
+  charts/taskflow/              # optional Helm packaging (Chapter 23)
+  scripts/
+    lab-up.sh                   # build everything and deploy to kind
+    lab-down.sh
+  .github/workflows/ci.yaml     # CI pipeline
+  docker-compose.yaml           # local API development
+\end{plaincode}
+
+\section{The API}
+
+The API is a single file. Read it once top-to-bottom; every Kubernetes-relevant
+choice is called out afterwards.
+
+\begin{pycode}{api/main.py}
+"""TaskFlow API - the backend of the Kubernetes Handbook capstone project."""
+import hashlib
+import logging
+import os
+import time
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Response
+from prometheus_fastapi_instrumentator import Instrumentator
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+from pydantic import BaseModel, Field
+
+# ---------------------------------------------------------------------------
+# Configuration comes ONLY from environment variables (12-factor).
+# In Kubernetes these are filled from a ConfigMap and a Secret.
+# ---------------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://taskflow:taskflow@localhost:5432/taskflow")
+APP_VERSION = os.getenv("APP_VERSION", "dev")
+POD_NAME = os.getenv("POD_NAME", "local")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "info").upper()
+
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+log = logging.getLogger("taskflow")
+
+# A small connection pool. open=False: we open it in the lifespan hook so the
+# process starts even if the database is not reachable yet.
+pool = ConnectionPool(
+    DATABASE_URL, min_size=1, max_size=10, open=False,
+    kwargs={"row_factory": dict_row},
+)
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS tasks (
+    id         SERIAL PRIMARY KEY,
+    title      TEXT        NOT NULL,
+    done       BOOLEAN     NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+"""
+_schema_ready = False
+
+
+def ensure_schema() -> None:
+    """Create the table on first use (idempotent, safe with many replicas)."""
+    global _schema_ready
+    if not _schema_ready:
+        with pool.connection() as conn:
+            conn.execute(SCHEMA)
+        _schema_ready = True
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    pool.open(wait=False)
+    log.info("taskflow-api starting version=%s pod=%s", APP_VERSION, POD_NAME)
+    yield
+    # Runs on SIGTERM: Kubernetes sends it before stopping the container.
+    log.info("shutting down, closing database pool")
+    pool.close()
+
+
+app = FastAPI(title="TaskFlow API", version=APP_VERSION, lifespan=lifespan)
+
+# Exposes Prometheus metrics at /metrics (http_requests_total, latency histograms...)
+Instrumentator().instrument(app).expose(app, include_in_schema=False)
+
+
+class TaskIn(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+
+
+class TaskPatch(BaseModel):
+    done: bool
+
+
+# ---------------------------------------------------------------------------
+# Health endpoints used by Kubernetes probes
+# ---------------------------------------------------------------------------
+@app.get("/healthz", include_in_schema=False)
+def healthz():
+    """Liveness: is the process able to answer at all? No dependencies here."""
+    return {"status": "ok"}
+
+
+@app.get("/readyz", include_in_schema=False)
+def readyz():
+    """Readiness: can we serve real traffic? Checks the database."""
+    try:
+        ensure_schema()
+        with pool.connection(timeout=2) as conn:
+            conn.execute("SELECT 1")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("not ready: %s", exc)
+        raise HTTPException(status_code=503, detail="database unavailable")
+    return {"status": "ready"}
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+@app.get("/api/info")
+def info():
+    """Shows which Pod answered - handy for watching load balancing."""
+    return {"service": "taskflow-api", "version": APP_VERSION, "pod": POD_NAME}
+
+
+@app.get("/api/tasks")
+def list_tasks():
+    ensure_schema()
+    with pool.connection() as conn:
+        return conn.execute(
+            "SELECT id, title, done, created_at FROM tasks ORDER BY id DESC LIMIT 100"
+        ).fetchall()
+
+
+@app.post("/api/tasks", status_code=201)
+def create_task(task: TaskIn):
+    ensure_schema()
+    with pool.connection() as conn:
+        return conn.execute(
+            "INSERT INTO tasks (title) VALUES (%s) RETURNING id, title, done, created_at",
+            (task.title,),
+        ).fetchone()
+
+
+@app.patch("/api/tasks/{task_id}")
+def update_task(task_id: int, patch: TaskPatch):
+    ensure_schema()
+    with pool.connection() as conn:
+        row = conn.execute(
+            "UPDATE tasks SET done = %s WHERE id = %s RETURNING id, title, done, created_at",
+            (patch.done, task_id),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    return row
+
+
+@app.delete("/api/tasks/{task_id}", status_code=204)
+def delete_task(task_id: int):
+    ensure_schema()
+    with pool.connection() as conn:
+        deleted = conn.execute("DELETE FROM tasks WHERE id = %s", (task_id,)).rowcount
+    if deleted == 0:
+        raise HTTPException(status_code=404, detail="task not found")
+    return Response(status_code=204)
+
+
+@app.get("/api/work")
+def work(ms: int = 100):
+    """Burns CPU for `ms` milliseconds. Used to demonstrate autoscaling."""
+    deadline = time.perf_counter() + min(ms, 2000) / 1000
+    digest = b"taskflow"
+    while time.perf_counter() < deadline:
+        digest = hashlib.sha256(digest).digest()
+    return {"pod": POD_NAME, "worked_ms": ms, "digest": digest.hex()[:12]}
+\end{pycode}
+
+\subsection{Why the code looks like this}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{4.0cm} L}
+\kheader \kth{Design choice} & \kth{Kubernetes reason} \\
+Config from env vars only & The same image runs in every environment; ConfigMaps/Secrets inject the differences. \\
+\kc{/healthz} has no dependencies & Used by the \emph{liveness} probe; a DB outage must not restart every Pod. \\
+\kc{/readyz} checks the DB & Used by the \emph{readiness} probe; Pods without a DB leave the Service until it is back. \\
+Pool opens lazily (\kc{wait=False}) & The Pod starts even if Postgres is still booting; readiness gates traffic. \\
+\kc{CREATE TABLE IF NOT EXISTS} & Idempotent: safe when several replicas start at once. \\
+Cleanup in \kc{lifespan} & Graceful shutdown on \kc{SIGTERM} during rollouts and scale-down. \\
+\kc{/metrics} endpoint & Scraped by Prometheus via a ServiceMonitor. \\
+\kc{/api/info} returns the Pod name & Lets you \emph{see} load balancing across replicas. \\
+\kc{/api/work} burns CPU & Generates realistic load to trigger the HPA. \\
+Logs to stdout & Collected by the node's log agent; \kc{kubectl logs} just works. \\
+\end{tabularx}
+\end{center}
+
+\subsection{Dependencies and tests}
+
+\begin{plaincode}{api/requirements.txt}
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30
+psycopg[binary]>=3.2
+psycopg-pool>=3.2
+prometheus-fastapi-instrumentator>=7.0
+\end{plaincode}
+
+\begin{plaincode}{api/requirements-dev.txt}
+pytest>=8.0
+httpx>=0.27
+\end{plaincode}
+
+\begin{plaincode}{api/pytest.ini}
+[pytest]
+pythonpath = .
+testpaths = tests
+\end{plaincode}
+
+\begin{pycode}{api/tests/test_api.py}
+"""Fast unit tests that need no database - they run in CI on every commit."""
+from fastapi.testclient import TestClient
+
+from main import app
+
+client = TestClient(app)
+
+
+def test_liveness_is_independent_of_database():
+    r = client.get("/healthz")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
+
+
+def test_info_reports_service_and_pod():
+    body = client.get("/api/info").json()
+    assert body["service"] == "taskflow-api"
+    assert "pod" in body
+
+
+def test_empty_title_is_rejected_before_touching_the_db():
+    r = client.post("/api/tasks", json={"title": ""})
+    assert r.status_code == 422
+
+
+def test_metrics_are_exposed_for_prometheus():
+    client.get("/healthz")
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    assert "http_requests_total" in r.text
+
+
+def test_work_endpoint_caps_duration():
+    body = client.get("/api/work", params={"ms": 1}).json()
+    assert body["worked_ms"] == 1
+\end{pycode}
+
+\section{The web frontend}
+
+A single HTML file with a little JavaScript. It calls the API with
+\emph{relative} URLs (\kc{/api/tasks}), so it works behind any hostname --- the
+Gateway decides where \kc{/api} goes.
+
+\begin{htmlcode}{web/index.html}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TaskFlow</title>
+  <style>
+    body   { font-family: system-ui, sans-serif; background: #eaf1fd; margin: 0; }
+    header { background: #326ce5; color: #fff; padding: 1rem 2rem; }
+    main   { max-width: 640px; margin: 2rem auto; background: #fff; padding: 1.5rem;
+             border-radius: 12px; box-shadow: 0 4px 16px rgba(15, 42, 92, .12); }
+    form   { display: flex; gap: .5rem; }
+    input  { flex: 1; padding: .6rem; border: 1px solid #8fb0f2; border-radius: 8px; }
+    button { background: #326ce5; color: #fff; border: 0; padding: .6rem 1rem; border-radius: 8px; cursor: pointer; }
+    li     { display: flex; justify-content: space-between; padding: .5rem 0; border-bottom: 1px solid #eaf1fd; }
+    .done  { text-decoration: line-through; color: #5f6b7a; }
+    small  { color: #5f6b7a; }
+  </style>
+</head>
+<body>
+  <header><h1>TaskFlow</h1><small id="served-by">connecting...</small></header>
+  <main>
+    <form id="new-task">
+      <input id="title" placeholder="What needs doing?" required maxlength="200">
+      <button type="submit">Add</button>
+    </form>
+    <ul id="tasks"></ul>
+  </main>
+  <script>
+    const list = document.getElementById("tasks");
+
+    async function api(path, options = {}) {
+      const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
+      if (!res.ok && res.status !== 204) throw new Error(res.status + " " + res.statusText);
+      return res.status === 204 ? null : res.json();
+    }
+
+    async function refresh() {
+      const info = await api("/api/info");
+      document.getElementById("served-by").textContent =
+        "API " + info.version + " served by Pod " + info.pod;
+      const tasks = await api("/api/tasks");
+      list.innerHTML = "";
+      for (const t of tasks) {
+        const li = document.createElement("li");
+        const label = document.createElement("span");
+        label.textContent = t.title;
+        if (t.done) label.className = "done";
+        label.onclick = () => api("/api/tasks/" + t.id, { method: "PATCH", body: JSON.stringify({ done: !t.done }) }).then(refresh);
+        const del = document.createElement("button");
+        del.textContent = "Delete";
+        del.onclick = () => api("/api/tasks/" + t.id, { method: "DELETE" }).then(refresh);
+        li.append(label, del);
+        list.append(li);
+      }
+    }
+
+    document.getElementById("new-task").onsubmit = async (e) => {
+      e.preventDefault();
+      const input = document.getElementById("title");
+      await api("/api/tasks", { method: "POST", body: JSON.stringify({ title: input.value }) });
+      input.value = "";
+      refresh();
+    };
+
+    refresh().catch(err => document.getElementById("served-by").textContent = "API error: " + err.message);
+  </script>
+</body>
+</html>
+\end{htmlcode}
+
+\section{Container images}
+
+\subsection{API image: multi-stage, non-root}
+
+\begin{dockercode}{api/Dockerfile}
+# syntax=docker/dockerfile:1
+
+# ---------- Stage 1: install dependencies ----------
+FROM python:3.12-slim AS builder
+WORKDIR /build
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# ---------- Stage 2: small runtime image ----------
+FROM python:3.12-slim
+# The version is a property of the build, so CI passes it in (e.g. the git SHA)
+ARG APP_VERSION=dev
+ENV APP_VERSION=${APP_VERSION} \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY --from=builder /install /usr/local
+COPY main.py .
+
+# Numeric UID so Kubernetes can verify runAsNonRoot
+RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin app
+USER 10001
+
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-graceful-shutdown", "20"]
+\end{dockercode}
+
+\begin{plaincode}{api/.dockerignore}
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+.venv/
+\end{plaincode}
+
+\subsection{Web image: unprivileged nginx}
+
+\begin{dockercode}{web/Dockerfile}
+# nginx-unprivileged runs as UID 101 and listens on 8080 (no root needed)
+FROM nginxinc/nginx-unprivileged:1.27-alpine
+COPY index.html /usr/share/nginx/html/index.html
+EXPOSE 8080
+\end{dockercode}
+
+\section{Run the API locally first}
+
+Before touching Kubernetes, prove the API works with Docker Compose. This is
+the fastest feedback loop while writing code.
+
+\begin{yamlcode}{docker-compose.yaml}
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: taskflow
+      POSTGRES_PASSWORD: taskflow
+      POSTGRES_DB: taskflow
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskflow"]
+      interval: 3s
+  api:
+    build: ./api
+    environment:
+      DATABASE_URL: postgresql://taskflow:taskflow@db:5432/taskflow
+      APP_VERSION: compose
+    ports: ["8000:8000"]
+    depends_on:
+      db: { condition: service_healthy }
+\end{yamlcode}
+
+\begin{bashcode}{terminal}
+docker compose up --build -d
+curl localhost:8000/readyz                                   # {"status":"ready"}
+curl -X POST localhost:8000/api/tasks -H 'Content-Type: application/json' -d '{"title":"Learn Kubernetes"}'
+curl localhost:8000/api/tasks
+# browse http://localhost:8000/docs for interactive API docs
+docker compose down -v
+
+# unit tests
+cd api && pip install -r requirements.txt -r requirements-dev.txt && pytest -q
+\end{bashcode}
+
+\begin{recap}
+\begin{itemize}
+  \item TaskFlow = nginx frontend + FastAPI backend + PostgreSQL, routed by a Gateway.
+  \item The code is ``Kubernetes-ready'': env-var config, separate liveness and
+        readiness endpoints, graceful shutdown, metrics, stdout logs.
+  \item Images are small, multi-stage, and run as non-root numeric users.
+  \item Next chapter: we do all the DevOps --- cluster, manifests, scaling,
+        security, monitoring, CI, and GitOps.
+\end{itemize}
+\end{recap}

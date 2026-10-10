@@ -1,0 +1,123 @@
+%=====================================================================
+%  THE KUBERNETES HANDBOOK
+%  From Zero to Production -- a beginner-to-advanced guide
+%
+%  Overleaf: Menu -> Compiler = pdfLaTeX, TeX Live 2023 or newer.
+%  The cover and part pages use TikZ overlays, so compile twice
+%  (Overleaf does this automatically).
+%=====================================================================
+\documentclass[11pt,a4paper,oneside,openany]{book}
+\input{style/k8s-style}
+
+\begin{document}
+
+%---------------------------------------------------------------------
+% Cover page
+%---------------------------------------------------------------------
+\begin{titlepage}
+\thispagestyle{empty}
+\begin{tikzpicture}[remember picture, overlay]
+  % background
+  \fill[k8snavy] (current page.south west) rectangle (current page.north east);
+  \fill[k8sblue] (current page.north west)
+       -- (current page.north east)
+       -- ($(current page.north east)+(0,-17.5cm)$)
+       -- ($(current page.north west)+(0,-21.5cm)$) -- cycle;
+  % decorative heptagons
+  \foreach \x/\y/\s/\o in {2.2/-2.5/3.2/0.35, 18.6/-4.2/4.6/0.25, 16.8/-15.5/2.4/0.4,
+                           3.4/-17.6/1.6/0.3, 10.5/-1.2/1.2/0.3, 19.5/-11/1.5/0.35}
+    \node[regular polygon, regular polygon sides=7, draw=white, opacity=\o,
+          line width=1.4pt, minimum size=\s cm]
+          at ($(current page.north west)+(\x cm,\y cm)$) {};
+  % logo
+  \node at ($(current page.north)+(0,-6.6cm)$) {\kimg[6.2cm]{k8s-logo-white}};
+  % title block
+  \node[text=white, align=center] at ($(current page.north)+(0,-11.9cm)$)
+      {{\fontsize{16}{20}\selectfont\bfseries\color{k8slight} T H E}\\[8pt]
+       {\fontsize{50}{56}\selectfont\bfseries KUBERNETES}\\[10pt]
+       {\fontsize{30}{36}\selectfont\bfseries HANDBOOK}};
+  \fill[k8sorange] ($(current page.north)+(-2.2cm,-15.0cm)$) rectangle
+                   ($(current page.north)+(2.2cm,-15.15cm)$);
+  \node[text=white, align=center] at ($(current page.north)+(0,-16.1cm)$)
+      {\Large From Zero to Production\\[4pt]
+       \large\color{k8slight}A complete beginner-to-advanced guide, with a hands-on DevOps capstone};
+  % icon strip
+  \node at ($(current page.south)+(0,7.3cm)$) {%
+     \kimg[1.25cm]{pod}\hspace{3pt}\kimg[1.25cm]{deploy}\hspace{3pt}%
+     \kimg[1.25cm]{rs}\hspace{3pt}\kimg[1.25cm]{svc}\hspace{3pt}%
+     \kimg[1.25cm]{ing}\hspace{3pt}\kimg[1.25cm]{cm}\hspace{3pt}%
+     \kimg[1.25cm]{secret}\hspace{3pt}\kimg[1.25cm]{pvc}\hspace{3pt}%
+     \kimg[1.25cm]{sts}\hspace{3pt}\kimg[1.25cm]{hpa}\hspace{3pt}%
+     \kimg[1.25cm]{ns}};
+  \node[text=k8smid, align=center] at ($(current page.south)+(0,5.2cm)$)
+      {\small Containers \textbullet{} Architecture \textbullet{} Workloads \textbullet{}
+       Networking \textbullet{} Storage \textbullet{} Security\\[2pt]
+       \small Observability \textbullet{} Helm \textbullet{} Operators \textbullet{}
+       GitOps \textbullet{} CI/CD \textbullet{} Production};
+  \node[text=white] at ($(current page.south)+(0,2.3cm)$)
+      {\kimg[0.8cm]{docker}\hspace{1em}\kimg[0.8cm]{helm}\hspace{1em}%
+       \kimg[0.8cm]{prometheus}\hspace{1em}\kimg[0.8cm]{argo}\hspace{1em}%
+       \kimg[0.8cm]{etcd-logo}\hspace{1em}\kimg[0.8cm]{containerd}\hspace{1em}%
+       \kimg[0.8cm]{istio}};
+  \node[text=k8smid] at ($(current page.south)+(0,1.1cm)$) {\footnotesize Edition 2026};
+\end{tikzpicture}
+\end{titlepage}
+
+%---------------------------------------------------------------------
+% Front matter
+%---------------------------------------------------------------------
+\frontmatter
+\include{chapters/00-preface}
+\tableofcontents
+
+%---------------------------------------------------------------------
+% Main matter
+%---------------------------------------------------------------------
+\mainmatter
+
+\kpart{Foundations}{Containers, the big idea, the architecture, and your first cluster}
+\include{chapters/01-containers}
+\include{chapters/02-what-is-kubernetes}
+\include{chapters/03-architecture}
+\include{chapters/04-setup}
+\include{chapters/05-kubectl-yaml}
+
+\kpart{Running Workloads}{Pods, labels, Deployments, and every other way to run code}
+\include{chapters/06-pods}
+\include{chapters/07-organizing}
+\include{chapters/08-deployments}
+\include{chapters/09-other-workloads}
+
+\kpart{Networking}{How Pods find each other and how the world finds your app}
+\include{chapters/10-services}
+\include{chapters/11-ingress-gateway-netpol}
+
+\kpart{Configuration \& Storage}{Separating config from code and keeping data alive}
+\include{chapters/12-config-secrets}
+\include{chapters/13-storage}
+
+\kpart{Operating Kubernetes}{Resources, scheduling, scaling, security, and observability}
+\include{chapters/14-resources-scheduling}
+\include{chapters/15-autoscaling}
+\include{chapters/16-security}
+\include{chapters/17-observability}
+
+\kpart{Advanced Kubernetes}{Packaging, extending, automating, and running in production}
+\include{chapters/18-helm-kustomize}
+\include{chapters/19-extending}
+\include{chapters/20-gitops-cicd}
+\include{chapters/21-production}
+
+\kpart{Capstone Project}{TaskFlow: build it, containerize it, ship it, scale it, watch it}
+\include{chapters/22-capstone-codebase}
+\include{chapters/23-capstone-devops}
+
+%---------------------------------------------------------------------
+% Appendices
+%---------------------------------------------------------------------
+\appendix
+\include{chapters/A-cheatsheet}
+\include{chapters/B-troubleshooting}
+\include{chapters/C-glossary}
+
+\end{document}

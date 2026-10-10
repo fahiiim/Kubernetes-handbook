@@ -1,0 +1,205 @@
+\kchapter{Autoscaling}{hpa}
+
+\begin{objectives}
+\begin{itemize}
+  \item the three dimensions of scaling: more Pods, bigger Pods, more nodes;
+  \item the Horizontal Pod Autoscaler and its algorithm;
+  \item the Vertical Pod Autoscaler and in-place resize;
+  \item Cluster Autoscaler and Karpenter;
+  \item event-driven scaling with KEDA.
+\end{itemize}
+\end{objectives}
+
+\section{Three ways to scale}
+
+\begin{center}
+\resizebox{0.95\linewidth}{!}{%
+\begin{tikzpicture}[
+  card/.style={draw=k8sblue, fill=k8slight, rounded corners=6pt, line width=1pt,
+               minimum width=4.6cm, minimum height=3.0cm, align=center, text width=4.2cm,
+               font=\footnotesize, text=k8snavy}]
+  \node[card] at (0,0) {{\large\bfseries\color{k8sblue}\faClone\ \ Horizontal}\\[4pt]
+        \textbf{HPA} adds or removes Pod replicas.\\[3pt]
+        \kimg[0.5cm]{pod}\kimg[0.5cm]{pod}\kimg[0.5cm]{pod} $\rightarrow$
+        \kimg[0.5cm]{pod}\kimg[0.5cm]{pod}\kimg[0.5cm]{pod}\kimg[0.5cm]{pod}\kimg[0.5cm]{pod}};
+  \node[card] at (5.2,0) {{\large\bfseries\color{k8sblue}\faIcon{expand-arrows-alt}\ \ Vertical}\\[4pt]
+        \textbf{VPA} changes CPU/memory requests of each Pod.\\[3pt]
+        \kimg[0.45cm]{pod} $\rightarrow$ \kimg[0.9cm]{pod}};
+  \node[card] at (10.4,0) {{\large\bfseries\color{k8sblue}\faServer\ \ Cluster}\\[4pt]
+        \textbf{Cluster Autoscaler / Karpenter} add or remove nodes.\\[3pt]
+        \kimg[0.5cm]{node}\kimg[0.5cm]{node} $\rightarrow$ \kimg[0.5cm]{node}\kimg[0.5cm]{node}\kimg[0.5cm]{node}};
+\end{tikzpicture}}
+\end{center}
+
+They work together: the HPA asks for more Pods; if there is no room, Pods go
+\kc{Pending}; the Cluster Autoscaler sees Pending Pods and adds a node.
+
+\section{Prerequisite: metrics-server}
+
+The HPA needs live CPU/memory figures from \kterm{metrics-server}.
+
+\begin{bashcode}{terminal}
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+# kind/local clusters use self-signed kubelet certs; allow them (lab only!)
+kubectl patch deployment metrics-server -n kube-system --type=json \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+
+kubectl top nodes
+kubectl top pods -A
+\end{bashcode}
+
+\section{Horizontal Pod Autoscaler}
+
+\begin{yamlcode}{api-hpa.yaml}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70        # % of the CPU *request*
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100                    # at most double every 30s
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 300   # wait 5 min before shrinking
+\end{yamlcode}
+
+\subsection{The algorithm}
+
+Every 15 seconds the HPA computes:
+
+\[
+  \text{desiredReplicas} = \left\lceil \text{currentReplicas} \times
+  \frac{\text{currentMetricValue}}{\text{targetMetricValue}} \right\rceil
+\]
+
+With 4 replicas at 140\,\% average CPU and a 70\,\% target:
+\(\lceil 4 \times 140/70 \rceil = 8\) replicas.
+
+\begin{warningbox}
+Utilisation is measured against the \textbf{request}. A Deployment without CPU
+requests cannot be autoscaled on CPU. Also, do not set \kc{replicas} in your
+Deployment YAML when an HPA manages it --- every \kc{apply} would reset the
+count.
+\end{warningbox}
+
+\begin{tryit}
+\begin{bashcode}{terminal}
+kubectl create deployment php --image=registry.k8s.io/hpa-example --port=80
+kubectl set resources deployment php --requests=cpu=200m
+kubectl expose deployment php --port=80
+kubectl autoscale deployment php --cpu-percent=50 --min=1 --max=10
+
+# generate load in a second terminal
+kubectl run load --rm -it --image=busybox:1.36 -- \
+  sh -c "while true; do wget -q -O- http://php; done"
+
+kubectl get hpa php -w      # watch replicas climb, then fall after you stop the load
+\end{bashcode}
+\end{tryit}
+
+\subsection{Custom and external metrics}
+
+Through the \kc{custom.metrics.k8s.io} and \kc{external.metrics.k8s.io} APIs
+(provided by adapters like the Prometheus Adapter), the HPA can scale on
+requests per second, queue length, or any business metric:
+
+\begin{yamlcode}{hpa-custom-metric.yaml}
+metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: http_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "50"
+\end{yamlcode}
+
+\section{Vertical Pod Autoscaler}
+
+The \kterm{VPA} (an add-on) watches real usage and recommends --- or applies ---
+better requests. Start with \kc{updateMode: "Off"} to only collect
+recommendations.
+
+\begin{yamlcode}{api-vpa.yaml}
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: api
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api
+  updatePolicy:
+    updateMode: "Off"          # "Off" = recommend only; "Recreate"/"Auto" apply changes
+\end{yamlcode}
+
+\begin{bashcode}{terminal}
+kubectl describe vpa api       # see "Target", "Lower Bound", "Upper Bound"
+\end{bashcode}
+
+Do not let the HPA and VPA both act on CPU/memory for the same workload: they
+will fight. Recent Kubernetes versions also support \emph{in-place Pod
+resize}, changing requests without restarting the Pod.
+
+\section{Scaling the cluster itself}
+
+\begin{itemize}
+  \item \textbf{Cluster Autoscaler} adds nodes to a node group when Pods are
+        Pending for lack of resources and removes under-used nodes.
+  \item \textbf{Karpenter} (AWS, Azure, and others) provisions right-sized
+        nodes on demand directly, often faster and cheaper.
+\end{itemize}
+
+\section{Event-driven autoscaling with KEDA}
+
+\textbf{KEDA} scales workloads on external events --- Kafka lag, RabbitMQ queue
+depth, SQS messages, cron schedules, Prometheus queries --- and can scale all
+the way \emph{to zero} when there is no work.
+
+\begin{yamlcode}{keda-scaledobject.yaml}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker
+spec:
+  scaleTargetRef:
+    name: worker               # a Deployment
+  minReplicaCount: 0
+  maxReplicaCount: 30
+  triggers:
+    - type: rabbitmq
+      metadata:
+        queueName: emails
+        mode: QueueLength
+        value: "20"            # one replica per 20 waiting messages
+      authenticationRef:
+        name: rabbitmq-auth
+\end{yamlcode}
+
+\begin{recap}
+\begin{itemize}
+  \item HPA = more Pods; VPA = bigger Pods; Cluster Autoscaler/Karpenter = more nodes.
+  \item HPA needs metrics-server and CPU/memory \emph{requests}.
+  \item Tune \kc{behavior} to scale up fast and down slowly.
+  \item KEDA scales on events and down to zero.
+\end{itemize}
+\end{recap}
