@@ -1,0 +1,207 @@
+\kchapter{Services and Cluster DNS}{svc}
+
+\begin{objectives}
+\begin{itemize}
+  \item the Kubernetes networking model in four rules;
+  \item why Pods need a Service in front of them;
+  \item ClusterIP, NodePort, LoadBalancer, ExternalName, and headless Services;
+  \item \kc{port}, \kc{targetPort}, and \kc{nodePort} --- finally explained;
+  \item how DNS names are built and how to debug them.
+\end{itemize}
+\end{objectives}
+
+\section{The networking model}
+
+Kubernetes networking rests on a few simple rules, implemented by your CNI plugin:
+
+\begin{enumerate}
+  \item Every Pod gets its \textbf{own IP address}.
+  \item Every Pod can reach every other Pod \textbf{directly}, across nodes, without NAT.
+  \item Agents on a node (like the kubelet) can reach all Pods on that node.
+  \item Containers in the same Pod share the IP and talk via \kc{localhost}.
+\end{enumerate}
+
+This flat network is simple, but Pod IPs are \emph{temporary}. Every
+replacement Pod gets a new IP, and a Deployment may have many Pods. Clients need
+one stable address that always reaches a healthy Pod. That is a \kterm{Service}.
+
+\section{What a Service is}
+
+A Service gives a set of Pods (chosen by a label selector):
+
+\begin{itemize}
+  \item a stable \textbf{virtual IP} (the ClusterIP) that never changes;
+  \item a stable \textbf{DNS name}, e.g.\ \kc{web.shop.svc.cluster.local};
+  \item \textbf{load balancing} across all \emph{Ready} Pods behind it.
+\end{itemize}
+
+\begin{center}
+\resizebox{0.95\linewidth}{!}{%
+\begin{tikzpicture}[
+  pod/.style={fill=k8sblue!12, draw=k8sblue, rounded corners=4pt, minimum width=2.6cm,
+              minimum height=1.05cm, font=\scriptsize, align=center},
+  >={Stealth[length=2.6mm]}]
+  \node[fill=k8sgray!15, draw=k8sgray, rounded corners=4pt, minimum width=2.4cm,
+        minimum height=1.2cm, font=\scriptsize, align=center] (c) at (-5,0)
+        {\faLaptopCode\ client Pod\\\ttfamily curl http://web};
+  \node[fill=k8sblue, text=white, rounded corners=6pt, minimum width=3.4cm,
+        minimum height=1.5cm, align=center, font=\small\bfseries] (s) at (0,0)
+        {\kimg[0.7cm]{svc}\\Service \ttfamily web\\[-1pt]\scriptsize\mdseries ClusterIP 10.96.12.7:80};
+  \node[pod] (p1) at (5,1.6)  {\textbf{Pod} 10.244.1.5\\:8080 \textcolor{k8sgreen}{\faCheckCircle\ Ready}};
+  \node[pod] (p2) at (5,0)    {\textbf{Pod} 10.244.2.9\\:8080 \textcolor{k8sgreen}{\faCheckCircle\ Ready}};
+  \node[pod, draw=k8sred, fill=k8sred!8] (p3) at (5,-1.6) {\textbf{Pod} 10.244.2.11\\:8080 \textcolor{k8sred}{\faTimesCircle\ Not ready}};
+  \draw[->, line width=1.3pt, k8sorange] (c) -- node[above, font=\scriptsize]{port 80} (s);
+  \draw[->, thick, k8sblue] (s) -- node[above, sloped, font=\scriptsize]{targetPort 8080} (p1);
+  \draw[->, thick, k8sblue] (s) -- (p2);
+  \draw[->, thick, k8sgray, dashed] (s) -- node[below, sloped, font=\scriptsize]{excluded} (p3);
+\end{tikzpicture}}
+\end{center}
+
+Behind the scenes, the EndpointSlice controller keeps a list of the IPs of all
+Ready Pods matching the selector, and kube-proxy on every node programs rules so
+that packets sent to the ClusterIP are forwarded to one of them.
+
+\begin{yamlcode}{web-service.yaml}
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  type: ClusterIP             # the default
+  selector:
+    app: web                  # traffic goes to Ready Pods with this label
+  ports:
+    - name: http
+      port: 80                # the port clients use on the Service
+      targetPort: 8080        # the port the container listens on (or a port NAME)
+      protocol: TCP
+\end{yamlcode}
+
+\begin{bashcode}{terminal}
+kubectl apply -f web-service.yaml
+kubectl get svc web
+kubectl get endpointslices -l kubernetes.io/service-name=web
+kubectl run tmp --rm -it --image=busybox:1.36 -- wget -qO- http://web
+\end{bashcode}
+
+\begin{protip}
+Name your container ports (\kc{name: http}) and use \kc{targetPort: http} in the
+Service. Then you can change the container port later without touching the Service.
+\end{protip}
+
+\section{Service types}
+
+\begin{center}
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  lay/.style={rounded corners=6pt, minimum height=1.0cm, font=\small\bfseries,
+              text=white, align=center}]
+  \node[lay, fill=k8sorange, minimum width=13.6cm] at (0,2.4) {LoadBalancer\quad\mdseries\footnotesize cloud LB with public IP \faArrowRight\ NodePort \faArrowRight\ ClusterIP};
+  \node[lay, fill=k8sdeep, minimum width=10.4cm] at (0,1.2) {NodePort\quad\mdseries\footnotesize every node's IP:30000-32767 \faArrowRight\ ClusterIP};
+  \node[lay, fill=k8sblue, minimum width=7.2cm] at (0,0) {ClusterIP\quad\mdseries\footnotesize internal virtual IP \faArrowRight\ Pods};
+  \node[font=\scriptsize\itshape, text=k8sgray] at (0,-0.9) {each type builds on the one below it};
+\end{tikzpicture}}
+\end{center}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{2.7cm} L L}
+\kheader \kth{Type} & \kth{Reachable from} & \kth{Typical use} \\
+\kc{ClusterIP} & Inside the cluster only. & Service-to-service traffic. The default and the most common. \\
+\kc{NodePort} & \kc{<any-node-IP>:<nodePort>} (30000--32767). & Quick demos, bare-metal setups behind your own LB. \\
+\kc{LoadBalancer} & A cloud load balancer with its own IP. & Exposing a single service publicly on a cloud. \\
+\kc{ExternalName} & DNS alias (CNAME) to an outside name. & Pointing \kc{db} at \kc{mydb.rds.amazonaws.com}. \\
+Headless (\kc{clusterIP: None}) & DNS returns each Pod IP. & StatefulSets, client-side load balancing. \\
+\end{tabularx}
+\end{center}
+
+\begin{yamlcode}{nodeport-and-lb.yaml}
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-nodeport
+spec:
+  type: NodePort
+  selector: { app: web }
+  ports:
+    - port: 80
+      targetPort: 8080
+      nodePort: 30080         # optional; picked automatically if omitted
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-public
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local   # keep client source IP; only nodes with Pods receive traffic
+  selector: { app: web }
+  ports:
+    - port: 80
+      targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments-db
+spec:
+  type: ExternalName
+  externalName: payments.abc123.eu-west-1.rds.amazonaws.com
+\end{yamlcode}
+
+\begin{warningbox}
+One \kc{LoadBalancer} Service = one cloud load balancer = one monthly bill. For
+many HTTP services, put a single Gateway or Ingress controller behind one load
+balancer and route by host/path instead (next chapter).
+\end{warningbox}
+
+\section{Cluster DNS}
+
+CoreDNS gives every Service a name. The full form is:
+
+\begin{center}
+\colorbox{k8slight}{\large\ttfamily
+\textcolor{k8sblue}{\bfseries web}.\textcolor{k8sdeep}{\bfseries shop}.\textcolor{k8snavy}{svc}.\textcolor{k8sgray}{cluster.local}}\\[4pt]
+\footnotesize service \quad.\quad namespace \quad.\quad type \quad.\quad cluster domain
+\end{center}
+
+\begin{itemize}
+  \item From a Pod in the \emph{same} namespace: just \kc{web}.
+  \item From another namespace: \kc{web.shop} (or the full name).
+  \item Headless Services in a StatefulSet also give each Pod a name:
+        \kc{db-0.db.shop.svc.cluster.local}.
+  \item Named ports get SRV records: \kc{\_http.\_tcp.web.shop.svc.cluster.local}.
+\end{itemize}
+
+\begin{bashcode}{terminal}
+kubectl run dns --rm -it --image=busybox:1.36 -- sh
+/ # nslookup web
+/ # nslookup web.shop.svc.cluster.local
+/ # cat /etc/resolv.conf        # search domains that make short names work
+\end{bashcode}
+
+\section{Useful Service options}
+
+\begin{itemize}
+  \item \kc{sessionAffinity: ClientIP} --- send a given client to the same Pod.
+  \item \kc{internalTrafficPolicy: Local} --- only route to Pods on the caller's node.
+  \item \kc{trafficDistribution: PreferClose} --- prefer topologically close endpoints (same zone).
+  \item Services without a selector + manual EndpointSlices --- point a
+        Service at IPs outside the cluster.
+\end{itemize}
+
+\section{Port-forward vs.\ Service}
+
+\kc{kubectl port-forward svc/web 8080:80} tunnels from your laptop to the
+cluster through the API server. It is perfect for development and debugging,
+but it is \emph{not} a way to serve real users.
+
+\begin{recap}
+\begin{itemize}
+  \item Pods get IPs, but IPs change; Services provide a stable IP + DNS name.
+  \item Services select \emph{Ready} Pods by label and load-balance across them.
+  \item \kc{port} is what clients call; \kc{targetPort} is where the container listens.
+  \item ClusterIP inside; NodePort/LoadBalancer outside; headless for per-Pod DNS.
+  \item DNS: \kc{service.namespace.svc.cluster.local}.
+\end{itemize}
+\end{recap}

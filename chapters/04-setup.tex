@@ -1,0 +1,180 @@
+\kchapter{Setting Up Your Kubernetes Lab}{node}
+
+\begin{objectives}
+\begin{itemize}
+  \item which local cluster tool to choose (kind, minikube, k3d, Docker Desktop);
+  \item how to install \kc{kubectl}, Docker, kind, and Helm on Windows, macOS, and Linux;
+  \item how to create a multi-node cluster and verify it works;
+  \item what a kubeconfig, a context, and a namespace default are.
+\end{itemize}
+\end{objectives}
+
+\section{Choosing a local cluster}
+
+You do not need a cloud account to learn Kubernetes. All of these run a real
+cluster on your laptop:
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{2.7cm} L L}
+\kheader \kth{Tool} & \kth{How it works} & \kth{Best for} \\
+\textbf{kind} & Each node is a Docker container. Multi-node in seconds. &
+  CI pipelines, multi-node experiments. \textbf{Used in this book.} \\
+\textbf{minikube} & A VM or container with many built-in add-ons. &
+  Beginners who like \kc{minikube addons enable \ldots}. \\
+\textbf{k3d} & Runs the lightweight k3s distribution in Docker. &
+  Very fast, low memory. Built-in load balancer. \\
+\textbf{Docker Desktop} & One-click single-node cluster. &
+  Simplest possible start on Windows/macOS. \\
+\end{tabularx}
+\end{center}
+
+\begin{protip}
+Give Docker at least \textbf{4 CPUs and 8\,GB RAM} for the later chapters
+(especially monitoring). On Windows, use Docker Desktop with the WSL\,2 backend.
+\end{protip}
+
+\section{Install the tools}
+
+You need four command-line tools:
+\kicon{docker}~\textbf{Docker} (to run containers and kind),
+\kicon{k8s-logo}~\textbf{kubectl} (to talk to clusters),
+\kicon{k8s-logo}~\textbf{kind} (to create local clusters), and
+\kicon{helm}~\textbf{Helm} (the package manager, used from Chapter 18).
+
+\subsection{Windows (PowerShell)}
+
+\begin{bashcode}{PowerShell}
+# Install Docker Desktop from https://www.docker.com/products/docker-desktop/
+winget install -e --id Kubernetes.kubectl
+winget install -e --id Kubernetes.kind
+winget install -e --id Helm.Helm
+\end{bashcode}
+
+\subsection{macOS (Homebrew)}
+
+\begin{bashcode}{terminal}
+brew install --cask docker
+brew install kubectl kind helm
+\end{bashcode}
+
+\subsection{Linux}
+
+\begin{bashcode}{terminal}
+# kubectl (latest stable)
+curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -m 0755 kubectl /usr/local/bin/kubectl
+
+# kind (check https://kind.sigs.k8s.io for the latest version)
+curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64
+sudo install -m 0755 kind /usr/local/bin/kind
+
+# Helm
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+\end{bashcode}
+
+Check everything:
+
+\begin{bashcode}{terminal}
+docker version
+kubectl version --client
+kind version
+helm version
+\end{bashcode}
+
+\section{Create a multi-node cluster}
+
+A single-node cluster hides interesting behaviour (scheduling, spreading,
+node failure). Let us create one control-plane node and two workers.
+
+\begin{yamlcode}{kind-cluster.yaml}
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: lab
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+\end{yamlcode}
+
+\begin{bashcode}{terminal}
+kind create cluster --config kind-cluster.yaml
+kubectl cluster-info --context kind-lab
+kubectl get nodes -o wide
+\end{bashcode}
+
+You should see something like:
+
+\begin{plaincode}{output}
+NAME                STATUS   ROLES           AGE   VERSION
+lab-control-plane   Ready    control-plane   60s   v1.33.1
+lab-worker          Ready    <none>          40s   v1.33.1
+lab-worker2         Ready    <none>          40s   v1.33.1
+\end{plaincode}
+
+Look inside: the control-plane components themselves run as Pods!
+
+\begin{bashcode}{terminal}
+kubectl get pods -n kube-system
+# coredns-..., etcd-lab-control-plane, kube-apiserver-lab-control-plane,
+# kube-controller-manager-..., kube-scheduler-..., kube-proxy-..., kindnet-...
+\end{bashcode}
+
+\section{kubeconfig and contexts}
+
+How does \kc{kubectl} know which cluster to talk to? It reads a
+\kterm{kubeconfig} file, by default \kc{\textasciitilde/.kube/config}. That file
+holds three lists:
+
+\begin{itemize}
+  \item \textbf{clusters} --- API server addresses and CA certificates;
+  \item \textbf{users} --- credentials (certificates, tokens, or plugins);
+  \item \textbf{contexts} --- a named pairing of \emph{cluster + user + default namespace}.
+\end{itemize}
+
+\begin{bashcode}{terminal}
+kubectl config get-contexts           # list contexts (* = current)
+kubectl config current-context        # e.g. kind-lab
+kubectl config use-context kind-lab   # switch cluster
+kubectl config set-context --current --namespace=dev   # change default namespace
+\end{bashcode}
+
+\begin{warningbox}
+The most expensive mistake in Kubernetes is running a command against the
+\emph{wrong cluster}. Always check your context before destructive commands.
+Tools like \kc{kubectx}/\kc{kubens} and a shell prompt that shows the current
+context are worth installing on day one.
+\end{warningbox}
+
+\section{Helpful extras}
+
+\begin{itemize}
+  \item \textbf{Shell completion}: \kc{kubectl completion bash|zsh|powershell}.
+  \item \textbf{An alias}: \kc{alias k=kubectl} (PowerShell:
+        \kc{Set-Alias k kubectl}).
+  \item \textbf{k9s}: a terminal UI to browse and manage the cluster.
+  \item \textbf{stern}: tail logs from many Pods at once.
+  \item \textbf{VS Code / Cursor Kubernetes extension}: YAML schema validation
+        and auto-completion.
+\end{itemize}
+
+\begin{tryit}
+Create the \kc{lab} cluster, then delete one worker's container with
+\kc{docker stop lab-worker2}. Run \kc{kubectl get nodes -w} and watch the node
+turn \kc{NotReady} after about 40 seconds. Start it again with
+\kc{docker start lab-worker2}. You just simulated a machine failure.
+\end{tryit}
+
+\subsection*{Cleaning up}
+
+\begin{bashcode}{terminal}
+kind delete cluster --name lab
+\end{bashcode}
+
+\begin{recap}
+\begin{itemize}
+  \item kind runs a full multi-node cluster inside Docker containers.
+  \item \kc{kubectl} reads kubeconfig; a \emph{context} = cluster + user + namespace.
+  \item Even control-plane components run as Pods in \kc{kube-system}.
+\end{itemize}
+\end{recap}

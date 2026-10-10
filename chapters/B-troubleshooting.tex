@@ -1,0 +1,107 @@
+\kchapter{Troubleshooting Playbook}{ep}
+
+When something is wrong, resist the urge to guess. Work from the outside in,
+and let Kubernetes tell you what it knows. Nearly every problem is solved by
+some combination of \kc{get}, \kc{describe}, \kc{logs}, and \kc{events}.
+
+\section{The universal first five commands}
+
+\begin{bashcode}{terminal}
+kubectl get pods -n <ns> -o wide                 # 1. what state is everything in?
+kubectl describe pod <pod> -n <ns>               # 2. read the Events at the bottom
+kubectl logs <pod> -n <ns> [--previous]          # 3. what did the app say?
+kubectl get events -n <ns> --sort-by=.lastTimestamp   # 4. what did the cluster do?
+kubectl get endpointslices -n <ns> -l kubernetes.io/service-name=<svc>   # 5. is the Service wired up?
+\end{bashcode}
+
+\section{Decision tree: my app is not reachable}
+
+\begin{center}
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  q/.style={draw=k8sblue, fill=k8slight, rounded corners=5pt, align=center,
+            font=\scriptsize\bfseries, text=k8snavy, minimum width=3.4cm, minimum height=1cm},
+  a/.style={fill=k8sorange!15, draw=k8sorange, rounded corners=5pt, align=center,
+            font=\scriptsize, text width=3.6cm, minimum height=1cm},
+  >={Stealth[length=2.4mm]}]
+  \node[q] (q1) at (0,0)      {Are the Pods Running\\and READY 1/1?};
+  \node[q] (q2) at (0,-2.2)   {Does the Service have\\endpoints?};
+  \node[q] (q3) at (0,-4.4)   {Does \kc{curl svc:port}\\work from inside?};
+  \node[q] (q4) at (0,-6.6)   {Does the Gateway/Ingress\\route show Accepted?};
+  \node[a] (a1) at (5.6,0)    {Fix the Pod first: see the status table below.};
+  \node[a] (a2) at (5.6,-2.2) {Selector does not match Pod labels, or Pods are not Ready.};
+  \node[a] (a3) at (5.6,-4.4) {Wrong \kc{targetPort}, app listening on 127.0.0.1, or a NetworkPolicy blocks it.};
+  \node[a] (a4) at (5.6,-6.6) {Check \kc{kubectl describe httproute}: parentRef, hostname, backend name/port.};
+  \node[a, fill=k8sgreen!15, draw=k8sgreen] (ok) at (0,-8.8) {Check DNS, external LB, firewall, and TLS certificates.};
+  \foreach \x/\y in {q1/q2, q2/q3, q3/q4, q4/ok} \draw[->, thick, k8sgreen] (\x) -- node[left, font=\tiny]{yes} (\y);
+  \foreach \x/\y in {q1/a1, q2/a2, q3/a3, q4/a4} \draw[->, thick, k8sred] (\x) -- node[above, font=\tiny]{no} (\y);
+\end{tikzpicture}}
+\end{center}
+
+\section{Pod status reference}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{3.4cm} L L}
+\kheader \kth{Symptom} & \kth{Likely cause} & \kth{What to check / do} \\
+\kc{Pending} & Not enough CPU/memory; nodeSelector/affinity/taint mismatch; PVC unbound. &
+   \kc{describe pod} events (``0/3 nodes are available\ldots''); \kc{get pvc}; lower requests or add nodes. \\
+\kc{ImagePullBackOff} \kc{ErrImagePull} & Typo in image/tag; private registry; rate limits. &
+   \kc{describe pod}; verify the tag exists; add \kc{imagePullSecrets}; for kind, \kc{kind load}. \\
+\kc{CrashLoopBackOff} & App exits on start: bad config, missing env, failing dependency, wrong command. &
+   \kc{logs --previous}; check env/ConfigMap/Secret; run the image locally. \\
+\kc{OOMKilled} & Memory limit too low or a leak. &
+   \kc{describe pod} (Last State); raise the limit; profile memory. \\
+\kc{CreateContainerConfigError} & Missing ConfigMap/Secret or key. &
+   \kc{describe pod}; \kc{get cm,secret}; check names after Kustomize hashing. \\
+Running but 0/1 READY & Readiness probe failing. &
+   \kc{describe pod} probe messages; hit the endpoint with \kc{exec}/\kc{port-forward}. \\
+Restarts keep rising & Liveness probe too strict, or real crashes. &
+   Add/relax a \kc{startupProbe}; check \kc{logs --previous}. \\
+\kc{Terminating} forever & Finalizers, or an unreachable node. &
+   \kc{get pod -o yaml} (finalizers); as a last resort \kc{delete --grace-period=0 --force}. \\
+\kc{Evicted} & Node under memory/disk pressure. &
+   \kc{describe node}; set requests; clean disk; check ephemeral storage. \\
+\end{tabularx}
+\end{center}
+
+\section{Networking checks}
+
+\begin{bashcode}{terminal}
+# A throw-away debug Pod with networking tools
+kubectl run netshoot --rm -it --image=nicolaka/netshoot -- bash
+#   nslookup api.taskflow-dev.svc.cluster.local
+#   curl -v http://api.taskflow-dev/api/info
+#   nc -zv postgres.taskflow-dev 5432
+
+kubectl get networkpolicy -n <ns>
+kubectl -n kube-system logs -l k8s-app=kube-dns          # CoreDNS problems
+kubectl get gateway,httproute -A                          # route status and conditions
+\end{bashcode}
+
+\begin{warningbox}
+If the namespace enforces the \kc{restricted} Pod Security profile, a plain
+\kc{kubectl run} debug Pod will be rejected. Debug from another namespace, use
+\kc{kubectl debug} on an existing Pod, or pass a compliant \kc{securityContext}
+with \kc{--overrides}.
+\end{warningbox}
+
+\section{Node and cluster checks}
+
+\begin{bashcode}{terminal}
+kubectl get nodes                                  # NotReady?
+kubectl describe node <node>                       # Conditions: MemoryPressure, DiskPressure, PIDPressure
+kubectl get --raw='/readyz?verbose'                # API server health checks
+kubectl get pods -n kube-system                    # control-plane and add-on Pods healthy?
+\end{bashcode}
+
+\section{Habits that prevent incidents}
+
+\begin{itemize}
+  \item Always \kc{kubectl diff} before \kc{apply} in shared environments.
+  \item Show the current context in your shell prompt.
+  \item Never use \kc{latest} tags; pin versions or digests.
+  \item Set requests and limits on everything.
+  \item Keep everything in Git; avoid \kc{kubectl edit} in production.
+  \item Write a runbook entry for every incident you solve.
+\end{itemize}

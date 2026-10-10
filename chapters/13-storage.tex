@@ -1,0 +1,208 @@
+\kchapter{Volumes and Persistent Storage}{pvc}
+
+\begin{objectives}
+\begin{itemize}
+  \item why container filesystems are temporary;
+  \item ephemeral volumes: \kc{emptyDir}, \kc{configMap}, \kc{secret}, \kc{projected};
+  \item PersistentVolumes, PersistentVolumeClaims, and StorageClasses;
+  \item access modes, reclaim policies, volume expansion, and snapshots;
+  \item the CSI driver model.
+\end{itemize}
+\end{objectives}
+
+\section{The problem}
+
+A container's filesystem lives and dies with the container. Restart the
+container and every file it wrote is gone. Databases, uploads, and caches need
+storage with a different lifetime. Kubernetes offers \kterm{volumes}: directories
+mounted into containers whose lifetime is managed separately.
+
+\section{Ephemeral volumes}
+
+These live as long as the \emph{Pod} (surviving container restarts, but not Pod deletion).
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{3.0cm} L}
+\kheader \kth{Volume} & \kth{Use} \\
+\kc{emptyDir} & Scratch space shared between containers in a Pod. Set
+                \kc{medium: Memory} for a RAM disk. \\
+\kc{configMap}, \kc{secret} & Expose config or credentials as files. \\
+\kc{projected} & Combine several sources (configMap, secret, downwardAPI,
+                 serviceAccountToken) into one directory. \\
+\kc{downwardAPI} & Expose Pod labels, annotations, and resources as files. \\
+Generic ephemeral & A per-Pod PVC that is deleted with the Pod. \\
+\end{tabularx}
+\end{center}
+
+\begin{warningbox}
+\kc{hostPath} mounts a directory from the node. It ties the Pod to one node and
+can give a container access to the host --- a serious security risk. Avoid it
+except for system agents that truly need it.
+\end{warningbox}
+
+\section{Persistent storage: three objects}
+
+\begin{center}
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  o/.style={draw=k8sblue, fill=white, line width=1pt, rounded corners=5pt,
+            minimum width=3.2cm, minimum height=1.9cm, align=center, font=\small\bfseries,
+            text=k8snavy},
+  >={Stealth[length=2.6mm]}]
+  \node[o] (pod) at (0,0) {\kimg[0.8cm]{pod}\\Pod\\[-2pt]\scriptsize\mdseries mounts the claim};
+  \node[o] (pvc) at (4.4,0) {\kimg[0.8cm]{pvc}\\PersistentVolume-\\Claim\\[-2pt]\scriptsize\mdseries ``I need 10Gi RWO''};
+  \node[o] (pv)  at (8.8,0) {\kimg[0.8cm]{pv}\\PersistentVolume\\[-2pt]\scriptsize\mdseries a real 10Gi disk};
+  \node[o] (sc)  at (8.8,-3.2) {\kimg[0.8cm]{sc}\\StorageClass\\[-2pt]\scriptsize\mdseries ``fast-ssd'' recipe};
+  \node[o, draw=k8sgray] (disk) at (13.2,0) {\Huge\faHdd\\[2pt]Cloud disk / NFS\\[-2pt]\scriptsize\mdseries EBS, PD, Azure Disk\ldots};
+  \draw[->, thick, k8sblue] (pod) -- node[above, font=\scriptsize]{uses} (pvc);
+  \draw[<->, thick, k8sblue] (pvc) -- node[above, font=\scriptsize]{bound} (pv);
+  \draw[->, thick, k8sorange, dashed] (sc) -- node[right, font=\scriptsize, align=left]{dynamically\\provisions} (pv);
+  \draw[->, thick, k8sgray] (pv) -- node[above, font=\scriptsize]{represents} (disk);
+  \draw[->, thick, k8sorange, dashed] (pvc.south) |- node[pos=0.75, below, font=\scriptsize]{storageClassName} (sc.west);
+\end{tikzpicture}}
+\end{center}
+
+\begin{itemize}
+  \item A \kicon{pv}~\kterm{PersistentVolume} (PV) is a piece of storage in the
+        cluster --- cluster-scoped, like a node is a piece of compute.
+  \item A \kicon{pvc}~\kterm{PersistentVolumeClaim} (PVC) is a namespaced
+        \emph{request} for storage: size, access mode, class.
+  \item A \kicon{sc}~\kterm{StorageClass} describes a \emph{kind} of storage and
+        which driver creates it, enabling \kterm{dynamic provisioning}: when a
+        PVC appears, a matching PV (and real disk) is created automatically.
+\end{itemize}
+
+\begin{analogy}
+A StorageClass is a menu item (``large SSD''), a PVC is your order, and the PV
+is the plate that arrives. You never walk into the kitchen yourself.
+\end{analogy}
+
+\begin{yamlcode}{storageclass.yaml}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: fast-ssd
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "false"
+provisioner: ebs.csi.aws.com        # the CSI driver (cloud specific)
+parameters:
+  type: gp3
+reclaimPolicy: Delete               # or Retain
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer   # create the disk in the zone where the Pod lands
+\end{yamlcode}
+
+\begin{yamlcode}{pvc-and-pod.yaml}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: uploads
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: fast-ssd        # omit to use the cluster default class
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: uploader
+spec:
+  containers:
+    - name: app
+      image: nginx:1.27
+      volumeMounts:
+        - name: data
+          mountPath: /usr/share/nginx/html
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: uploads
+\end{yamlcode}
+
+\begin{bashcode}{terminal}
+kubectl get storageclass           # kind ships "standard" (local-path) as default
+kubectl apply -f pvc-and-pod.yaml
+kubectl get pvc,pv
+kubectl describe pvc uploads       # Pending? read the events
+\end{bashcode}
+
+\section{Access modes}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{3.6cm} P{1.6cm} L}
+\kheader \kth{Mode} & \kth{Short} & \kth{Meaning} \\
+\kc{ReadWriteOnce} & RWO & Mounted read-write by one \emph{node}. Block disks (EBS, PD). Most common. \\
+\kc{ReadWriteOncePod} & RWOP & Read-write by exactly one \emph{Pod}. Strongest guarantee. \\
+\kc{ReadOnlyMany} & ROX & Read-only by many nodes. \\
+\kc{ReadWriteMany} & RWX & Read-write by many nodes. Needs a shared filesystem (NFS, EFS, CephFS, Azure Files). \\
+\end{tabularx}
+\end{center}
+
+\section{Lifecycle and reclaim policy}
+
+When a PVC is deleted, the bound PV's \kc{reclaimPolicy} decides the fate of the data:
+
+\begin{itemize}
+  \item \kc{Delete} --- the PV and underlying disk are deleted (default for dynamic provisioning);
+  \item \kc{Retain} --- the PV and disk are kept for manual recovery. Use it for anything precious.
+\end{itemize}
+
+\begin{warningbox}
+With \kc{reclaimPolicy: Delete}, \kc{kubectl delete pvc} or deleting a
+namespace \textbf{destroys the data}. For production databases use a
+\kc{Retain} class and take backups or snapshots.
+\end{warningbox}
+
+\section{Expansion and snapshots}
+
+If the StorageClass has \kc{allowVolumeExpansion: true}, grow a volume by editing
+the PVC's \kc{spec.resources.requests.storage}. Shrinking is not supported.
+
+With a CSI driver that supports it, take point-in-time snapshots:
+
+\begin{yamlcode}{snapshot.yaml}
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: uploads-2026-10-10
+spec:
+  volumeSnapshotClassName: csi-snapclass
+  source:
+    persistentVolumeClaimName: uploads
+---
+# Restore: a new PVC whose dataSource is the snapshot
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: uploads-restored
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+  dataSource:
+    name: uploads-2026-10-10
+    kind: VolumeSnapshot
+    apiGroup: snapshot.storage.k8s.io
+\end{yamlcode}
+
+\section{CSI: the storage plugin model}
+
+The \kterm{Container Storage Interface} lets storage vendors ship drivers
+independently of Kubernetes releases. Every modern backend --- AWS EBS/EFS, GCP
+PD/Filestore, Azure Disk/Files, Ceph (Rook), Longhorn, Portworx, NetApp --- has a
+CSI driver. You install the driver, create a StorageClass that names it, and
+PVCs do the rest.
+
+\begin{recap}
+\begin{itemize}
+  \item Container filesystems are temporary; volumes give data a separate lifetime.
+  \item PVC = request, PV = actual storage, StorageClass = recipe for dynamic provisioning.
+  \item Choose access modes and reclaim policies deliberately; \kc{Delete} really deletes.
+  \item Use snapshots and backups for anything you cannot lose.
+\end{itemize}
+\end{recap}

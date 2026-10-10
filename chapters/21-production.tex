@@ -1,0 +1,171 @@
+\kchapter{Kubernetes in Production}{control-plane}
+\label{ch:production}
+
+\begin{objectives}
+\begin{itemize}
+  \item managed vs.\ self-managed clusters;
+  \item high availability for the control plane and your apps;
+  \item upgrades without drama;
+  \item backup and disaster recovery with etcd snapshots and Velero;
+  \item multi-cluster, service mesh, cost management, and a go-live checklist.
+\end{itemize}
+\end{objectives}
+
+\section{Managed or self-managed?}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{3.0cm} L L}
+\kheader \kth{} & \kth{Managed (EKS, GKE, AKS\ldots)} & \kth{Self-managed (kubeadm, k3s, RKE2, Talos)} \\
+Control plane & Run, patched, and backed up by the provider. & You run etcd, API servers, certificates. \\
+Upgrades & A button or API call (nodes still need care). & Fully your responsibility. \\
+Cost & Small control-plane fee. & Engineers' time. \\
+When & Almost always, in the cloud. & On-premises, edge, air-gapped, special compliance. \\
+\end{tabularx}
+\end{center}
+
+\begin{keyidea}
+Unless you have a strong reason, \textbf{use a managed Kubernetes service}.
+Your competitive advantage is your application, not running etcd.
+\end{keyidea}
+
+\section{High availability}
+
+\subsection{Control plane}
+
+\begin{itemize}
+  \item 3 (or 5) control-plane nodes across availability zones;
+  \item etcd with an odd number of members (quorum = majority);
+  \item API servers behind a load balancer.
+\end{itemize}
+
+\subsection{Your applications}
+
+\begin{itemize}
+  \item at least \textbf{2--3 replicas} for anything user-facing;
+  \item \textbf{topology spread} across zones and nodes;
+  \item \textbf{PodDisruptionBudgets} so drains never take everything down;
+  \item \textbf{readiness probes} and graceful shutdown for zero-downtime deploys;
+  \item \textbf{requests/limits} so noisy neighbours cannot starve you;
+  \item node pools across multiple zones.
+\end{itemize}
+
+\section{Upgrades}
+
+Kubernetes releases a minor version about every four months and supports each
+for roughly 14 months. Falling behind is painful; upgrade regularly.
+
+\begin{enumerate}
+  \item \textbf{Read the release notes} and the \emph{deprecated API} guide.
+        Check your manifests and charts with tools like \textbf{pluto} or
+        \textbf{kubent}.
+  \item Upgrade \textbf{one minor version at a time} (1.32 $\rightarrow$ 1.33 $\rightarrow$ 1.34).
+  \item Upgrade the \textbf{control plane first}, then nodes. Nodes may lag
+        the control plane by a few minor versions, never lead it.
+  \item Upgrade nodes by \textbf{cordon \& drain} or by creating a new node pool
+        and moving workloads (blue/green nodes).
+  \item Upgrade add-ons (CNI, CSI, CoreDNS, Gateway controller) to compatible versions.
+  \item Practise on staging first.
+\end{enumerate}
+
+\section{Backup and disaster recovery}
+
+\subsection{etcd snapshots (self-managed clusters)}
+
+\begin{bashcode}{terminal}
+ETCDCTL_API=3 etcdctl snapshot save /backup/etcd-$(date +%F).db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key
+
+etcdutl snapshot status /backup/etcd-2026-10-10.db --write-out=table
+\end{bashcode}
+
+\subsection{Velero: backing up workloads and volumes}
+
+\textbf{Velero} backs up Kubernetes objects and persistent volume data to object
+storage, and restores them --- into the same or a different cluster.
+
+\begin{bashcode}{terminal}
+velero backup create shop-daily --include-namespaces shop --snapshot-volumes
+velero schedule create shop-nightly --schedule "0 3 * * *" --include-namespaces shop --ttl 720h
+velero restore create --from-backup shop-daily
+\end{bashcode}
+
+\begin{warningbox}
+A backup you have never restored is a hope, not a backup. Schedule regular
+restore drills into a scratch cluster and measure how long they take (your
+real Recovery Time Objective).
+\end{warningbox}
+
+Remember too that if \emph{everything} (manifests, Helm values, Argo CD
+Applications) is in Git, rebuilding a cluster's configuration is ``create cluster,
+install Argo CD, point at the repo''. Only \emph{data} needs separate backups.
+
+\section{Multi-cluster}
+
+Teams run several clusters for isolation (prod vs.\ non-prod), regions, latency,
+or blast-radius reduction. Common tools:
+
+\begin{itemize}
+  \item \textbf{Argo CD ApplicationSets} / \textbf{Flux} to deploy to many clusters from one repo;
+  \item \textbf{Cluster API} to create and upgrade clusters declaratively;
+  \item global load balancing / DNS to route users to the nearest healthy cluster.
+\end{itemize}
+
+\section{Service mesh}
+
+A \kicon{istio}~\kterm{service mesh} (Istio, Linkerd, Cilium Service Mesh) adds
+a transparent network layer between services, giving you:
+
+\begin{itemize}
+  \item \textbf{mutual TLS} between every service, with identities, automatically;
+  \item fine-grained \textbf{traffic control}: retries, timeouts, circuit breaking, canaries;
+  \item uniform \textbf{telemetry}: golden metrics and traces for every call.
+\end{itemize}
+
+Modern meshes offer \emph{sidecar-less} modes (Istio Ambient, Cilium) that lower
+the overhead. Adopt a mesh when you actually need mTLS everywhere or advanced
+traffic control --- it is a significant piece of infrastructure.
+
+\section{Cost management}
+
+\begin{itemize}
+  \item \textbf{Right-size requests} using real usage (VPA recommendations,
+        Prometheus data). Over-requesting is the number-one source of waste.
+  \item Use \textbf{autoscaling} at every level, and scale dev environments to zero at night.
+  \item Run interruption-tolerant workloads on \textbf{spot/preemptible} nodes.
+  \item Use \textbf{ARM nodes} where your images support them.
+  \item Allocate costs per namespace/team with \textbf{OpenCost} or \textbf{Kubecost}.
+\end{itemize}
+
+\section{Go-live checklist}
+
+\begin{multicols}{2}
+\begin{itemize}
+  \item[\textcolor{k8sblue}{\faCheckSquare}] Managed control plane, multi-zone nodes
+  \item[\textcolor{k8sblue}{\faCheckSquare}] Everything in Git; GitOps sync
+  \item[\textcolor{k8sblue}{\faCheckSquare}] Images pinned, scanned, signed
+  \item[\textcolor{k8sblue}{\faCheckSquare}] Probes, requests/limits, PDBs
+  \item[\textcolor{k8sblue}{\faCheckSquare}] HPA + cluster autoscaling
+  \item[\textcolor{k8sblue}{\faCheckSquare}] Topology spread across zones
+  \item[\textcolor{k8sblue}{\faCheckSquare}] TLS via cert-manager
+  \item[\textcolor{k8sblue}{\faCheckSquare}] NetworkPolicies, restricted PSS
+  \item[\textcolor{k8sblue}{\faCheckSquare}] Least-privilege RBAC, SSO
+  \item[\textcolor{k8sblue}{\faCheckSquare}] External secret manager
+  \item[\textcolor{k8sblue}{\faCheckSquare}] Metrics, logs, traces, SLO alerts
+  \item[\textcolor{k8sblue}{\faCheckSquare}] Runbooks for every alert
+  \item[\textcolor{k8sblue}{\faCheckSquare}] Backups + tested restores
+  \item[\textcolor{k8sblue}{\faCheckSquare}] Upgrade plan and cadence
+\end{itemize}
+\end{multicols}
+
+\begin{recap}
+\begin{itemize}
+  \item Prefer managed clusters; spend your time on your apps.
+  \item HA = replicas + spread + PDBs + probes, across zones.
+  \item Upgrade one minor version at a time, control plane first.
+  \item Back up data (Velero, snapshots) and keep config in Git; test restores.
+\end{itemize}
+\end{recap}

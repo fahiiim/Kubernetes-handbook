@@ -1,0 +1,185 @@
+\kchapter{Organising: Labels, Selectors, Annotations, Namespaces}{ns}
+
+\begin{objectives}
+\begin{itemize}
+  \item how labels and selectors glue Kubernetes objects together;
+  \item the recommended label set;
+  \item when to use annotations instead of labels;
+  \item how namespaces divide a cluster, and what they do \emph{not} isolate.
+\end{itemize}
+\end{objectives}
+
+\section{Labels: sticky notes on objects}
+
+A \kterm{label} is a key/value pair attached to an object's \kc{metadata}.
+Labels mean nothing to Kubernetes on their own --- \emph{you} decide what they
+mean --- but they are how objects find each other.
+
+\begin{yamlcode}{labels.yaml}
+metadata:
+  name: api-7d9f8c-xk2lp
+  labels:
+    app.kubernetes.io/name: taskflow-api
+    app.kubernetes.io/part-of: taskflow
+    app.kubernetes.io/version: "1.4.0"
+    app.kubernetes.io/component: backend
+    environment: production
+    team: payments
+\end{yamlcode}
+
+\section{Selectors: queries over labels}
+
+A \kterm{selector} picks objects by their labels. You will see selectors
+everywhere:
+
+\begin{itemize}
+  \item a \textbf{Service} sends traffic to Pods whose labels match its selector;
+  \item a \textbf{Deployment/ReplicaSet} owns the Pods matching its selector;
+  \item a \textbf{NetworkPolicy} applies to Pods matching its selector;
+  \item \kc{kubectl} filters with \kc{-l}.
+\end{itemize}
+
+\begin{bashcode}{terminal}
+kubectl get pods -l app=web                       # equality
+kubectl get pods -l 'environment in (staging,production)'   # set-based
+kubectl get pods -l 'app=web,tier!=cache'          # AND, not-equal
+kubectl get pods --show-labels
+kubectl get pods -L app,version                    # labels as columns
+\end{bashcode}
+
+In YAML, selectors come in two flavours:
+
+\begin{yamlcode}{selectors.yaml}
+# Simple form (Services)
+selector:
+  app: web
+
+# Rich form (Deployments, Jobs, NetworkPolicies...)
+selector:
+  matchLabels:
+    app: web
+  matchExpressions:
+    - key: tier
+      operator: In            # In, NotIn, Exists, DoesNotExist
+      values: [frontend, edge]
+\end{yamlcode}
+
+\begin{center}
+\begin{tikzpicture}[
+  podn/.style={fill=k8sblue!12, draw=k8sblue, rounded corners=4pt, align=center,
+               font=\scriptsize, minimum width=2.4cm, minimum height=1.1cm},
+  podx/.style={fill=k8sgray!10, draw=k8sgray, rounded corners=4pt, align=center,
+               font=\scriptsize, minimum width=2.4cm, minimum height=1.1cm, text=k8sgray},
+  >={Stealth[length=2.6mm]}]
+  \node[fill=k8sblue, text=white, rounded corners=5pt, align=center, font=\small\bfseries,
+        minimum width=3cm, minimum height=1.1cm] (svc) at (0,2.4)
+        {\kicon{svc}\ Service\\[-1pt]\scriptsize\mdseries selector: app=web};
+  \node[podn] (p1) at (-3.6,0) {\textbf{Pod}\\app=web\\tier=frontend};
+  \node[podn] (p2) at (-0.9,0) {\textbf{Pod}\\app=web\\tier=frontend};
+  \node[podn] (p3) at (1.8,0)  {\textbf{Pod}\\app=web\\tier=edge};
+  \node[podx] (p4) at (4.5,0)  {\textbf{Pod}\\app=db};
+  \foreach \p in {p1,p2,p3} \draw[->, thick, k8sblue] (svc) -- (\p);
+  \draw[->, thick, k8sgray, dashed] (svc) -- node[right, font=\scriptsize]{\faTimes} (p4);
+\end{tikzpicture}
+\end{center}
+
+\begin{warningbox}
+A Deployment's \kc{spec.selector} is \textbf{immutable} and must match its Pod
+template labels. Choose stable labels (like \kc{app.kubernetes.io/name}), never
+something that changes per release like a version number.
+\end{warningbox}
+
+\section{Annotations: notes for tools and humans}
+
+\kterm{Annotations} are also key/value metadata, but they are \emph{not} used
+for selecting. Values can be long (even JSON). Tools read them to change
+behaviour.
+
+\begin{yamlcode}{annotations.yaml}
+metadata:
+  annotations:
+    kubernetes.io/change-cause: "upgrade to 1.4.0 for faster search"
+    prometheus.io/scrape: "true"
+    owner-contact: "payments-oncall@example.com"
+    description: "Public API for task management"
+\end{yamlcode}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{4.2cm} L L}
+\kheader \kth{} & \kth{Labels} & \kth{Annotations} \\
+Used by selectors & Yes & No \\
+Value size & Short (63 chars) & Large (up to 256\,KB total) \\
+Typical use & Identity, grouping, routing & Tool configuration, docs, audit trail \\
+\end{tabularx}
+\end{center}
+
+\section{Namespaces: rooms in the house}
+
+A \kterm{namespace} is a virtual partition of a cluster. Names need only be
+unique \emph{within} a namespace, so team A and team B can both have a
+Deployment called \kc{api}.
+
+\begin{bashcode}{terminal}
+kubectl get namespaces
+# default, kube-system, kube-public, kube-node-lease  (+ your own)
+
+kubectl create namespace dev
+kubectl apply -f app.yaml -n dev
+kubectl get pods -n dev
+kubectl get pods --all-namespaces      # or -A
+kubectl config set-context --current --namespace=dev
+\end{bashcode}
+
+\begin{yamlcode}{namespace.yaml}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dev
+  labels:
+    team: platform
+    pod-security.kubernetes.io/enforce: baseline   # see Chapter 16
+\end{yamlcode}
+
+\subsection{What namespaces give you}
+
+\begin{itemize}
+  \item a scope for names;
+  \item a boundary for \textbf{RBAC} permissions (Chapter 16);
+  \item a boundary for \textbf{ResourceQuotas} and \textbf{LimitRanges} (Chapter 14);
+  \item a target for \textbf{NetworkPolicies} (Chapter 11);
+  \item a DNS segment: \kc{api.dev.svc.cluster.local}.
+\end{itemize}
+
+\begin{warningbox}
+By default, namespaces are \textbf{not} a network or security wall. A Pod in
+\kc{dev} can talk to a Pod in \kc{prod} unless you add NetworkPolicies, and
+Pods on the same node share a kernel. For hard multi-tenancy, use separate
+clusters or strong policy tooling.
+\end{warningbox}
+
+\subsection{Cluster-scoped objects}
+
+Some objects do not live in any namespace: Nodes, Namespaces themselves,
+PersistentVolumes, StorageClasses, ClusterRoles, CRDs. Check with
+\kc{kubectl api-resources --namespaced=false}.
+
+\subsection{A common layout}
+
+\begin{itemize}
+  \item one namespace \emph{per application per environment} (\kc{shop-dev},
+        \kc{shop-staging}) on shared clusters, or
+  \item one namespace \emph{per application} with separate clusters per
+        environment (recommended for production isolation);
+  \item platform tools in their own namespaces: \kc{monitoring},
+        \kc{argocd}, \kc{cert-manager}, \kc{ingress}.
+\end{itemize}
+
+\begin{recap}
+\begin{itemize}
+  \item Labels identify and group; selectors query labels.
+  \item Services, Deployments, and policies all find Pods via selectors.
+  \item Annotations carry non-identifying metadata for tools.
+  \item Namespaces scope names, RBAC, and quotas --- but are not a firewall by themselves.
+\end{itemize}
+\end{recap}

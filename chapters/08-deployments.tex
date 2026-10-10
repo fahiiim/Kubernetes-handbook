@@ -1,0 +1,213 @@
+\kchapter{ReplicaSets and Deployments}{deploy}
+
+\begin{objectives}
+\begin{itemize}
+  \item how a ReplicaSet keeps N copies of a Pod alive;
+  \item why you use Deployments instead of ReplicaSets directly;
+  \item rolling updates, \kc{maxSurge} and \kc{maxUnavailable};
+  \item checking, pausing, and rolling back rollouts;
+  \item release strategies: recreate, rolling, blue/green, canary.
+\end{itemize}
+\end{objectives}
+
+\section{The ownership chain}
+
+\begin{center}
+\begin{tikzpicture}[
+  obj/.style={draw=k8sblue, fill=white, line width=1pt, rounded corners=5pt,
+              minimum width=3.0cm, minimum height=1.6cm, align=center,
+              font=\small\bfseries, text=k8snavy},
+  >={Stealth[length=3mm]}]
+  \node[obj] (d) at (0,0) {\kimg[0.8cm]{deploy}\\Deployment\\[-2pt]\scriptsize\mdseries web};
+  \node[obj] (r) at (4.4,0) {\kimg[0.8cm]{rs}\\ReplicaSet\\[-2pt]\scriptsize\mdseries web-7d9f8c};
+  \foreach \y/\n in {1.5/xk2lp, 0/p9q4m, -1.5/b7c1z}
+    \node[obj, minimum width=2.6cm, minimum height=1.0cm] (p\n) at (8.6,\y)
+      {\kicon{pod}\ Pod\\[-2pt]\scriptsize\mdseries web-7d9f8c-\n};
+  \draw[->, thick, k8sblue] (d) -- node[above, font=\scriptsize]{owns} (r);
+  \foreach \n in {xk2lp, p9q4m, b7c1z} \draw[->, thick, k8sblue] (r) -- (p\n.west);
+\end{tikzpicture}
+\end{center}
+
+\begin{itemize}
+  \item A \kterm{ReplicaSet} has one job: ensure exactly \kc{replicas} Pods
+        matching its selector exist. Too few? Create. Too many? Delete.
+  \item A \kterm{Deployment} manages ReplicaSets to provide \emph{updates}:
+        each new version of the Pod template gets a new ReplicaSet, and the
+        Deployment shifts replicas from old to new.
+\end{itemize}
+
+\begin{keyidea}
+For stateless applications, the \textbf{Deployment} is the object you create.
+You will rarely write a ReplicaSet yourself, and almost never a bare Pod.
+\end{keyidea}
+
+\section{A complete Deployment}
+
+\begin{yamlcode}{web-deployment.yaml}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    app: web
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5          # keep 5 old ReplicaSets for rollback
+  selector:
+    matchLabels:
+      app: web                     # must match template labels
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1                  # at most 1 extra Pod during the update
+      maxUnavailable: 0            # never go below 3 ready Pods
+  template:                        # the Pod template
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet: { path: /, port: 80 }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { memory: 128Mi }
+\end{yamlcode}
+
+\begin{bashcode}{terminal}
+kubectl apply -f web-deployment.yaml
+kubectl get deploy,rs,pods -l app=web
+kubectl scale deployment web --replicas=5
+\end{bashcode}
+
+\begin{tryit}
+Delete one of the Pods with \kc{kubectl delete pod <name>} and immediately run
+\kc{kubectl get pods -w}. Within a second the ReplicaSet creates a replacement
+with a new random suffix. That is self-healing in action.
+\end{tryit}
+
+\section{Rolling updates}
+
+Change anything in the Pod template --- the image, an env var, a label --- and
+the Deployment performs a \kterm{rolling update}:
+
+\begin{center}
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  v1/.style={regular polygon, regular polygon sides=7, fill=k8sgray!70, text=white,
+             minimum size=0.95cm, inner sep=0pt, font=\scriptsize\bfseries},
+  v2/.style={regular polygon, regular polygon sides=7, fill=k8sblue, text=white,
+             minimum size=0.95cm, inner sep=0pt, font=\scriptsize\bfseries},
+  nw/.style={regular polygon, regular polygon sides=7, draw=k8sblue, dashed, text=k8sblue,
+             minimum size=0.95cm, inner sep=0pt, font=\scriptsize\bfseries}]
+  \foreach \row/\lbl in {0/Start: 3 old Pods,
+                         -1.3/Surge: start 1 new Pod,
+                         -2.6/{New Pod Ready: remove 1 old, start next},
+                         -3.9/Repeat\ldots,
+                         -5.2/Done: 3 new Pods}
+    \node[font=\footnotesize\bfseries, text=k8snavy, anchor=west] at (-6.2,\row) {\lbl};
+  % row 0
+  \foreach \x in {0,1.2,2.4} \node[v1] at (\x,0) {v1};
+  % row 1
+  \foreach \x in {0,1.2,2.4} \node[v1] at (\x,-1.3) {v1};
+  \node[nw] at (3.6,-1.3) {v2};
+  % row 2
+  \foreach \x in {0,1.2} \node[v1] at (\x,-2.6) {v1};
+  \node[v2] at (2.4,-2.6) {v2}; \node[nw] at (3.6,-2.6) {v2};
+  % row 3
+  \node[v1] at (0,-3.9) {v1};
+  \foreach \x in {1.2,2.4} \node[v2] at (\x,-3.9) {v2};
+  \node[nw] at (3.6,-3.9) {v2};
+  % row 4
+  \foreach \x in {0,1.2,2.4} \node[v2] at (\x,-5.2) {v2};
+  % legend
+  \node[v1] at (6.2,-1.3) {v1}; \node[anchor=west, font=\scriptsize] at (6.7,-1.3) {old version};
+  \node[v2] at (6.2,-2.6) {v2}; \node[anchor=west, font=\scriptsize] at (6.7,-2.6) {new version, Ready};
+  \node[nw] at (6.2,-3.9) {v2}; \node[anchor=west, font=\scriptsize] at (6.7,-3.9) {new version, starting};
+\end{tikzpicture}}
+\end{center}
+
+With \kc{maxSurge: 1} and \kc{maxUnavailable: 0}, Kubernetes adds one new
+Pod, waits until it is \emph{Ready} (readiness probe passes), removes one old
+Pod, and repeats. Capacity never drops, so users see no downtime.
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{3.3cm} L}
+\kheader \kth{Setting} & \kth{Effect} \\
+\kc{maxSurge} & How many Pods \emph{above} \kc{replicas} may exist during the
+                update (number or \%, default 25\%). Higher = faster, more resources. \\
+\kc{maxUnavailable} & How many Pods \emph{below} \kc{replicas} may be
+                unavailable (default 25\%). 0 = safest. \\
+\kc{minReadySeconds} & A new Pod must stay Ready this long before it counts.
+                Catches apps that crash shortly after starting. \\
+\kc{progressDeadlineSeconds} & If no progress for this long (default 600),
+                the rollout is marked failed. \\
+\end{tabularx}
+\end{center}
+
+\section{Managing rollouts}
+
+\begin{bashcode}{terminal}
+# Trigger an update (or edit the YAML and apply it)
+kubectl set image deployment/web web=nginx:1.28
+kubectl annotate deployment/web kubernetes.io/change-cause="nginx 1.28"
+
+kubectl rollout status deployment/web       # wait and watch progress
+kubectl rollout history deployment/web      # list revisions
+kubectl rollout history deployment/web --revision=2
+
+kubectl rollout undo deployment/web                 # back to previous revision
+kubectl rollout undo deployment/web --to-revision=1
+
+kubectl rollout pause deployment/web        # batch several changes...
+kubectl rollout resume deployment/web       # ...then roll them out at once
+kubectl rollout restart deployment/web      # re-create Pods (e.g. to reload config)
+\end{bashcode}
+
+\begin{tryit}
+Set the image to a tag that does not exist: \kc{kubectl set image
+deployment/web web=nginx:does-not-exist}. Run \kc{kubectl get pods}: the new
+Pod is stuck in \kc{ImagePullBackOff}, but because \kc{maxUnavailable} is 0
+your three old Pods keep serving. Fix it with \kc{kubectl rollout undo
+deployment/web}.
+\end{tryit}
+
+\section{Release strategies}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{2.6cm} L P{3.6cm}}
+\kheader \kth{Strategy} & \kth{How} & \kth{Trade-off} \\
+\textbf{Recreate} & \kc{strategy.type: Recreate}: kill all old Pods, then start new. &
+   Downtime; needed when two versions cannot run together. \\
+\textbf{Rolling} & Default. Replace Pods gradually. &
+   Two versions serve at once for a while. \\
+\textbf{Blue/Green} & Run two Deployments (\kc{blue}, \kc{green}); switch the
+   Service selector from one to the other. & Instant switch and rollback;
+   double resources. \\
+\textbf{Canary} & Send a small slice of traffic (say 5\%) to the new version,
+   watch metrics, then increase. & Safest for risky changes; needs traffic
+   splitting (Gateway API, service mesh, or Argo Rollouts). \\
+\end{tabularx}
+\end{center}
+
+\begin{protip}
+For automated canaries with metric-based promotion and rollback, look at
+\textbf{Argo Rollouts} or \textbf{Flagger}. Both build on the concepts in this
+chapter and integrate with the Gateway API.
+\end{protip}
+
+\begin{recap}
+\begin{itemize}
+  \item Deployment $\rightarrow$ ReplicaSet $\rightarrow$ Pods.
+  \item Changing the Pod template triggers a rolling update via a new ReplicaSet.
+  \item Readiness probes + \kc{maxUnavailable: 0} = zero-downtime releases.
+  \item \kc{kubectl rollout status/history/undo} manage the release.
+\end{itemize}
+\end{recap}

@@ -1,0 +1,289 @@
+\kchapter{Ingress, Gateway API, and Network Policies}{ing}
+
+\begin{objectives}
+\begin{itemize}
+  \item how HTTP traffic enters a cluster through one entry point;
+  \item the Ingress resource and the newer, more powerful Gateway API;
+  \item TLS certificates with cert-manager;
+  \item NetworkPolicies: a firewall between Pods;
+  \item what a CNI plugin is and how to choose one.
+\end{itemize}
+\end{objectives}
+
+\section{The problem: many services, one front door}
+
+You have a frontend, an API, and an admin panel. You want:
+
+\begin{itemize}
+  \item \kc{shop.example.com} $\rightarrow$ frontend;
+  \item \kc{shop.example.com/api} $\rightarrow$ API;
+  \item \kc{admin.example.com} $\rightarrow$ admin;
+  \item HTTPS everywhere, with one public IP and one load balancer.
+\end{itemize}
+
+This is \kterm{Layer-7} (HTTP) routing. Kubernetes models it with two APIs:
+the original \textbf{Ingress} and its successor, the \textbf{Gateway API}.
+Both are only \emph{descriptions}; a \kterm{controller} (a proxy such as
+Envoy, NGINX, HAProxy, or Traefik running in your cluster) reads them and
+does the actual routing.
+
+\begin{center}
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  b/.style={rounded corners=5pt, minimum height=1.1cm, align=center, font=\scriptsize\bfseries},
+  >={Stealth[length=2.6mm]}]
+  \node[b, fill=k8sgray!20, minimum width=2cm] (u) at (0,0) {\faGlobe\\Internet};
+  \node[b, fill=k8sorange, text=white, minimum width=2.4cm] (lb) at (3.2,0) {Cloud LB\\[-1pt]\mdseries one public IP};
+  \node[b, fill=k8sblue, text=white, minimum width=3.0cm, minimum height=1.6cm] (g) at (7.0,0)
+       {\kimg[0.6cm]{ing}\\Gateway / Ingress\\controller (Envoy\ldots)};
+  \node[b, fill=k8slight, draw=k8sblue, minimum width=3.1cm] (s1) at (11.6,1.6) {\kicon{svc}\ frontend\\[-1pt]\mdseries\ttfamily shop.example.com/};
+  \node[b, fill=k8slight, draw=k8sblue, minimum width=3.1cm] (s2) at (11.6,0)   {\kicon{svc}\ api\\[-1pt]\mdseries\ttfamily shop.example.com/api};
+  \node[b, fill=k8slight, draw=k8sblue, minimum width=3.1cm] (s3) at (11.6,-1.6){\kicon{svc}\ admin\\[-1pt]\mdseries\ttfamily admin.example.com};
+  \draw[->, thick] (u) -- node[above, font=\tiny]{HTTPS} (lb);
+  \draw[->, thick] (lb) -- (g);
+  \foreach \s in {s1,s2,s3} \draw[->, thick, k8sblue] (g) -- (\s.west);
+\end{tikzpicture}}
+\end{center}
+
+\section{Ingress}
+
+\begin{yamlcode}{shop-ingress.yaml}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shop
+spec:
+  ingressClassName: traefik        # which controller should handle this
+  tls:
+    - hosts: [shop.example.com]
+      secretName: shop-tls          # certificate + key stored in a Secret
+  rules:
+    - host: shop.example.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service: { name: api, port: { number: 80 } }
+          - path: /
+            pathType: Prefix
+            backend:
+              service: { name: frontend, port: { number: 80 } }
+\end{yamlcode}
+
+Ingress is stable and widely supported, but it is limited: only host/path
+routing is standard, and everything else (rewrites, timeouts, canaries, header
+matching) is done with controller-specific annotations that are not portable.
+
+\begin{warningbox}
+The popular community \textbf{ingress-nginx} controller has been
+\textbf{retired} by the Kubernetes project (best-effort maintenance ended in
+March 2026). Existing clusters should plan a migration. For new work, prefer the
+\textbf{Gateway API} with a maintained implementation such as Envoy Gateway,
+Istio, Cilium, NGINX Gateway Fabric, Traefik, or your cloud provider's gateway.
+\end{warningbox}
+
+\section{Gateway API}
+
+The \kterm{Gateway API} is the modern, role-oriented, expressive replacement
+for Ingress (GA since v1.0 in 2023). It splits responsibility across three
+kinds of objects:
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{2.7cm} P{3.4cm} L}
+\kheader \kth{Object} & \kth{Owned by} & \kth{Describes} \\
+\kc{GatewayClass} & Infrastructure provider & Which controller implements gateways (like a StorageClass for traffic). \\
+\kc{Gateway} & Platform / cluster operator & A concrete entry point: listeners, ports, hostnames, TLS. \\
+\kc{HTTPRoute} (+ \kc{GRPCRoute}, \kc{TLSRoute}\ldots) & Application team & How requests are matched and forwarded to Services. \\
+\end{tabularx}
+\end{center}
+
+\begin{yamlcode}{gateway.yaml}
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: public
+  namespace: infra
+spec:
+  gatewayClassName: eg                 # e.g. Envoy Gateway
+  listeners:
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: "*.example.com"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: wildcard-example-com
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              gateway-access: "true"
+\end{yamlcode}
+
+\begin{yamlcode}{shop-route.yaml}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: shop
+  namespace: shop
+spec:
+  parentRefs:
+    - name: public
+      namespace: infra
+  hostnames: ["shop.example.com"]
+  rules:
+    - matches:
+        - path: { type: PathPrefix, value: /api }
+      backendRefs:
+        - name: api-v1
+          port: 80
+          weight: 90                   # canary: 90% to v1 ...
+        - name: api-v2
+          port: 80
+          weight: 10                   # ... and 10% to v2
+    - matches:
+        - headers:
+            - name: x-beta-user
+              value: "true"
+      backendRefs:
+        - name: frontend-beta
+          port: 80
+    - backendRefs:                     # default route
+        - name: frontend
+          port: 80
+\end{yamlcode}
+
+Weighted backends, header matching, redirects, rewrites, timeouts, and request
+mirroring are all part of the \emph{standard} API --- no annotations needed.
+
+\section{TLS certificates with cert-manager}
+
+\kicon{cert-manager}~\textbf{cert-manager} automates certificates from Let's
+Encrypt (or your internal CA) and stores them as Secrets that Ingress and
+Gateways reference. It renews them before expiry.
+
+\begin{yamlcode}{cluster-issuer.yaml}
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: ops@example.com
+    privateKeySecretRef:
+      name: letsencrypt-account-key
+    solvers:
+      - http01:
+          gatewayHTTPRoute:
+            parentRefs:
+              - name: public
+                namespace: infra
+\end{yamlcode}
+
+\section{Network Policies: a firewall for Pods}
+
+By default \textbf{every Pod can talk to every other Pod}. A
+\kterm{NetworkPolicy} restricts that. Once any policy selects a Pod for a
+direction (ingress or egress), only traffic explicitly allowed by some policy
+is permitted in that direction.
+
+\begin{keyidea}
+NetworkPolicies are \textbf{allow-lists} and they are \textbf{additive}. Start
+with ``deny all'' in a namespace, then add policies that open exactly the paths
+your application needs.
+\end{keyidea}
+
+\begin{yamlcode}{default-deny.yaml}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: shop
+spec:
+  podSelector: {}           # every Pod in the namespace
+  policyTypes: [Ingress, Egress]
+\end{yamlcode}
+
+\begin{yamlcode}{allow-api-to-db.yaml}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-allow-api
+  namespace: shop
+spec:
+  podSelector:
+    matchLabels: { app: db }           # this policy protects the DB Pods
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: { app: api }  # only API Pods ...
+      ports:
+        - port: 5432                    # ... on the Postgres port
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: shop
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { port: 53, protocol: UDP }
+        - { port: 53, protocol: TCP }
+\end{yamlcode}
+
+\begin{warningbox}
+After a default-deny on \emph{egress}, Pods cannot even resolve DNS. Always add
+the DNS egress rule above. Also note the YAML subtlety: \kc{namespaceSelector}
+and \kc{podSelector} in the \emph{same} list item mean AND; as \emph{separate}
+items (each with its own dash) they mean OR.
+\end{warningbox}
+
+\begin{warningbox}
+\textbf{NetworkPolicies need a CNI plugin that enforces them.} Calico and Cilium
+do; Flannel alone does not. If your plugin ignores them, your policies are
+silently decorative.
+\end{warningbox}
+
+\section{CNI: the network plugin}
+
+The \kterm{Container Network Interface} (CNI) is the plugin standard that gives
+Pods their IPs and connects them. Popular choices:
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{2.4cm} L}
+\kheader \kth{Plugin} & \kth{Highlights} \\
+Cilium & eBPF-based, very fast, NetworkPolicies at L3--L7, can replace
+         kube-proxy, rich observability (Hubble). \\
+Calico & Mature, BGP routing, strong NetworkPolicy support, widely used on-prem. \\
+Flannel & Simple overlay network; no policy enforcement by itself. \\
+Cloud CNIs & AWS VPC CNI, Azure CNI, GKE Dataplane V2 --- Pods get VPC-native IPs. \\
+\end{tabularx}
+\end{center}
+
+\begin{recap}
+\begin{itemize}
+  \item One controller + one load balancer can route all HTTP traffic by host and path.
+  \item Ingress is simple and stable; the Gateway API is the expressive, portable successor.
+  \item cert-manager automates TLS certificates.
+  \item NetworkPolicies are additive allow-lists; start from default-deny and allow DNS.
+  \item Policies only work if your CNI enforces them.
+\end{itemize}
+\end{recap}

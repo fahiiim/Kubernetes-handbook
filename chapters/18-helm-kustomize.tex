@@ -1,0 +1,243 @@
+\kchapter{Packaging: Helm and Kustomize}{helm}
+
+\begin{objectives}
+\begin{itemize}
+  \item why plain YAML stops scaling across environments;
+  \item Kustomize: bases, overlays, patches, generators;
+  \item Helm: charts, values, templates, releases, repositories;
+  \item when to choose which (and how to use both).
+\end{itemize}
+\end{objectives}
+
+\section{The problem}
+
+Your app needs the same manifests in dev, staging, and production, but with
+different replica counts, image tags, resource sizes, and hostnames. Copying
+folders and editing by hand quickly leads to drift and mistakes. Two tools
+dominate:
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{2.4cm} L L}
+\kheader \kth{} & \kth{Kustomize} & \kth{Helm} \\
+Idea & Patch plain YAML with overlays. & Render templates with values. \\
+Templating & None --- pure YAML. & Go templates + Sprig functions. \\
+Built in & Yes: \kc{kubectl apply -k}. & Separate CLI. \\
+Distribution & Git folders. & Versioned charts in repos/OCI registries. \\
+Release tracking & No. & Yes: install, upgrade, rollback, history. \\
+Best for & Your own apps across environments. & Sharing apps; installing third-party software. \\
+\end{tabularx}
+\end{center}
+
+\section{Kustomize}
+
+\subsection{Layout}
+
+\begin{plaincode}{folder layout}
+k8s/
+  base/
+    deployment.yaml
+    service.yaml
+    kustomization.yaml
+  overlays/
+    dev/
+      kustomization.yaml
+    prod/
+      kustomization.yaml
+      replicas-patch.yaml
+\end{plaincode}
+
+\begin{yamlcode}{k8s/base/kustomization.yaml}
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - deployment.yaml
+  - service.yaml
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: shop
+    includeSelectors: false
+configMapGenerator:
+  - name: app-config
+    literals:
+      - LOG_LEVEL=info
+\end{yamlcode}
+
+\begin{yamlcode}{k8s/overlays/prod/kustomization.yaml}
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: shop-prod
+resources:
+  - ../../base
+images:
+  - name: ghcr.io/example/api          # rewrite the image tag everywhere
+    newTag: "1.4.0"
+patches:
+  - path: replicas-patch.yaml
+  - target:
+      kind: Deployment
+      name: api
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/limits/memory
+        value: 1Gi
+configMapGenerator:
+  - name: app-config
+    behavior: merge
+    literals:
+      - LOG_LEVEL=warn
+\end{yamlcode}
+
+\begin{yamlcode}{k8s/overlays/prod/replicas-patch.yaml}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+spec:
+  replicas: 4
+\end{yamlcode}
+
+\begin{bashcode}{terminal}
+kubectl kustomize k8s/overlays/prod      # render to stdout and inspect
+kubectl apply -k k8s/overlays/prod       # render and apply
+kubectl diff  -k k8s/overlays/prod
+\end{bashcode}
+
+\begin{keyidea}
+\kc{configMapGenerator} appends a content hash to the ConfigMap name
+(\kc{app-config-7g2k9}) and rewrites references to it. Change a value and the
+Deployment's Pod template changes too --- triggering a rolling update
+automatically.
+\end{keyidea}
+
+\section{Helm}
+
+\kicon{helm}~\textbf{Helm} is the package manager for Kubernetes. Its
+vocabulary:
+
+\begin{itemize}
+  \item a \kterm{chart} --- a package of templated manifests;
+  \item \kterm{values} --- the inputs that customise a chart;
+  \item a \kterm{release} --- one installed instance of a chart in a cluster;
+  \item a \kterm{repository} --- where charts are published (HTTP or OCI registry).
+\end{itemize}
+
+\subsection{Using other people's charts}
+
+\begin{bashcode}{terminal}
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm search repo redis
+helm show values bitnami/redis > redis-values.yaml     # see every knob
+
+helm install cache bitnami/redis -n cache --create-namespace -f redis-values.yaml
+helm list -A
+helm upgrade cache bitnami/redis -n cache -f redis-values.yaml --set replica.replicaCount=2
+helm history cache -n cache
+helm rollback cache 1 -n cache
+helm uninstall cache -n cache
+
+# OCI registries work too
+helm install eg oci://docker.io/envoyproxy/gateway-helm --version v1.5.0 -n envoy-gateway-system --create-namespace
+\end{bashcode}
+
+\subsection{Writing your own chart}
+
+\begin{bashcode}{terminal}
+helm create api      # scaffolds a working chart
+\end{bashcode}
+
+\begin{plaincode}{chart layout}
+api/
+  Chart.yaml            # name, version, appVersion
+  values.yaml           # default values
+  templates/
+    _helpers.tpl        # reusable named templates
+    configmap.yaml
+    deployment.yaml
+    service.yaml
+    hpa.yaml
+    NOTES.txt           # printed after install
+\end{plaincode}
+
+\begin{yamlcode}{api/values.yaml}
+replicaCount: 2
+image:
+  repository: ghcr.io/example/api
+  tag: ""                  # defaults to Chart.appVersion
+  pullPolicy: IfNotPresent
+service:
+  port: 80
+resources:
+  requests: { cpu: 100m, memory: 128Mi }
+  limits:   { memory: 256Mi }
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+\end{yamlcode}
+
+\begin{plaincode}{api/templates/deployment.yaml}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "api.fullname" . }}
+  labels:
+    {{- include "api.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "api.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "api.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      containers:
+        - name: api
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8000
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+\end{plaincode}
+
+\begin{bashcode}{terminal}
+helm lint ./api
+helm template my-api ./api -f values-prod.yaml      # render locally, no cluster needed
+helm install my-api ./api -n shop --create-namespace
+helm upgrade --install my-api ./api -n shop -f values-prod.yaml --atomic --wait
+helm package ./api && helm push api-0.1.0.tgz oci://ghcr.io/example/charts
+\end{bashcode}
+
+\begin{protip}
+In CI/CD always use \kc{helm upgrade --install --atomic --wait}: it installs or
+upgrades idempotently, waits until resources are ready, and rolls back
+automatically on failure.
+\end{protip}
+
+\section{Which one should I use?}
+
+A common, pragmatic split:
+
+\begin{itemize}
+  \item \textbf{Helm} to install third-party software (Prometheus, cert-manager,
+        Argo CD, databases).
+  \item \textbf{Kustomize} (or a small Helm chart) for your own services.
+  \item Kustomize can even inflate Helm charts (\kc{helmCharts:} field), and
+        Argo CD understands both natively.
+\end{itemize}
+
+\begin{recap}
+\begin{itemize}
+  \item Kustomize: base + overlays + patches, template-free, built into kubectl.
+  \item Helm: charts + values = releases, with upgrade/rollback history.
+  \item Generators/checksums turn config changes into rolling updates.
+\end{itemize}
+\end{recap}

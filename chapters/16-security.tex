@@ -1,0 +1,279 @@
+\kchapter{Security}{role}
+
+\begin{objectives}
+\begin{itemize}
+  \item the layers of Kubernetes security (the ``4 Cs'');
+  \item authentication, authorisation with RBAC, and ServiceAccounts;
+  \item hardening Pods with \kc{securityContext} and Pod Security Standards;
+  \item admission policies with ValidatingAdmissionPolicy, Kyverno, and Gatekeeper;
+  \item supply-chain security: scanning, signing, and minimal images;
+  \item a practical hardening checklist.
+\end{itemize}
+\end{objectives}
+
+\section{Defence in depth: the 4 Cs}
+
+\begin{center}
+\begin{tikzpicture}
+  \foreach \rad/\col in {3.3/k8snavy, 2.5/k8sdeep, 1.7/k8sblue, 0.9/k8smid}
+    \fill[\col] (0,0) circle (\rad);
+  \node[text=white, font=\bfseries] at (0,2.85) {\faCloud\ Cloud / datacentre};
+  \node[text=white, font=\bfseries] at (0,2.05) {\kicon{k8s-logo-white}\ Cluster};
+  \node[text=white, font=\bfseries] at (0,1.25) {\faCube\ Container};
+  \node[text=k8snavy, font=\bfseries] at (0,0) {\faCode\ Code};
+\end{tikzpicture}
+\end{center}
+
+Each layer protects the one inside it. A perfectly configured cluster cannot
+save vulnerable code, and secure code cannot survive an exposed cloud account.
+This chapter focuses on the \emph{cluster} and \emph{container} layers.
+
+\section{Who are you? Authentication}
+
+Kubernetes has no ``user'' objects. Humans are authenticated externally:
+
+\begin{itemize}
+  \item \textbf{client certificates} (common in kubeadm/kind admin configs);
+  \item \textbf{OIDC} tokens from an identity provider (Google, Entra ID, Okta, Keycloak);
+  \item \textbf{cloud IAM} integrations (EKS access entries, GKE IAM, AKS Entra ID).
+\end{itemize}
+
+Workloads authenticate as \kicon{sa}~\kterm{ServiceAccounts} --- real
+namespaced objects. Every Pod runs as one (\kc{default} if you do not choose),
+and receives a short-lived, automatically rotated token.
+
+\section{What may you do? RBAC}
+
+\kterm{Role-Based Access Control} answers ``may \emph{this subject} perform
+\emph{this verb} on \emph{this resource}?'' with four objects:
+
+\begin{center}
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  o/.style={draw=k8sblue, fill=white, line width=1pt, rounded corners=5pt,
+            minimum width=3.1cm, minimum height=1.9cm, align=center, font=\small\bfseries,
+            text=k8snavy},
+  >={Stealth[length=2.6mm]}]
+  \node[o] (u)  at (0,0)    {\kimg[0.8cm]{user}\\User / Group\\[-2pt]\scriptsize\mdseries or ServiceAccount};
+  \node[o] (rb) at (4.5,0)  {\kimg[0.8cm]{rb}\\RoleBinding\\[-2pt]\scriptsize\mdseries (namespace)};
+  \node[o] (r)  at (9,0)    {\kimg[0.8cm]{role}\\Role\\[-2pt]\scriptsize\mdseries verbs on resources};
+  \node[o] (crb) at (4.5,-2.6) {\kimg[0.8cm]{crb}\\ClusterRoleBinding\\[-2pt]\scriptsize\mdseries (whole cluster)};
+  \node[o] (cr) at (9,-2.6) {\kimg[0.8cm]{c-role}\\ClusterRole\\[-2pt]\scriptsize\mdseries cluster-wide rules};
+  \draw[->, thick, k8sblue] (rb) -- node[above, font=\scriptsize]{subjects} (u);
+  \draw[->, thick, k8sblue] (rb) -- node[above, font=\scriptsize]{roleRef} (r);
+  \draw[->, thick, k8sdeep] (crb.west) -| (u.south);
+  \draw[->, thick, k8sdeep] (crb) -- (cr);
+  \draw[->, thick, k8sorange, dashed] (rb.south east) -- node[right, font=\scriptsize, pos=0.4]{may also reference} (cr.north west);
+\end{tikzpicture}}
+\end{center}
+
+\begin{yamlcode}{rbac-ci-deployer.yaml}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ci-deployer
+  namespace: shop
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployer
+  namespace: shop
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: [""]                     # "" = the core API group
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ci-deployer-binding
+  namespace: shop
+subjects:
+  - kind: ServiceAccount
+    name: ci-deployer
+    namespace: shop
+roleRef:
+  kind: Role
+  name: deployer
+  apiGroup: rbac.authorization.k8s.io
+\end{yamlcode}
+
+\begin{bashcode}{terminal}
+kubectl auth can-i update deployments -n shop --as=system:serviceaccount:shop:ci-deployer   # yes
+kubectl auth can-i delete secrets -n shop --as=system:serviceaccount:shop:ci-deployer       # no
+kubectl auth can-i --list --as=system:serviceaccount:shop:ci-deployer -n shop
+\end{bashcode}
+
+\begin{warningbox}
+Be stingy. Avoid \kc{cluster-admin} bindings, wildcard \kc{"*"} verbs or
+resources, and granting \kc{get/list} on Secrets (listing Secrets reveals their
+contents). Remember that the ability to \emph{create Pods} in a namespace
+effectively grants access to every Secret and ServiceAccount in it.
+\end{warningbox}
+
+Built-in ClusterRoles cover most needs: \kc{view}, \kc{edit}, \kc{admin}, and
+\kc{cluster-admin}. Bind \kc{view} or \kc{edit} per namespace for developers.
+
+\begin{protip}
+Set \kc{automountServiceAccountToken: false} on Pods that never call the
+Kubernetes API. Fewer tokens lying around means less to steal.
+\end{protip}
+
+\section{Hardening Pods: securityContext}
+
+\begin{yamlcode}{hardened-pod.yaml}
+spec:
+  automountServiceAccountToken: false
+  securityContext:                       # Pod level
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile:
+      type: RuntimeDefault               # block dangerous syscalls
+  containers:
+    - name: api
+      image: ghcr.io/example/api@sha256:3b1f...   # pin by digest
+      securityContext:                   # container level
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        privileged: false
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp                # writable scratch, since root fs is read-only
+  volumes:
+    - name: tmp
+      emptyDir: {}
+\end{yamlcode}
+
+\section{Pod Security Standards}
+
+Kubernetes defines three standard profiles, enforced per namespace by the
+built-in \textbf{Pod Security Admission} controller (it replaced the removed
+PodSecurityPolicy):
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{2.4cm} L}
+\kheader \kth{Profile} & \kth{Effect} \\
+\kc{privileged} & No restrictions. Only for trusted system components. \\
+\kc{baseline} & Blocks known privilege escalations: privileged containers, host namespaces, hostPath, etc. \\
+\kc{restricted} & Baseline plus best practices: non-root, drop all capabilities, seccomp, no privilege escalation. \\
+\end{tabularx}
+\end{center}
+
+\begin{yamlcode}{restricted-namespace.yaml}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shop
+  labels:
+    pod-security.kubernetes.io/enforce: restricted   # reject violating Pods
+    pod-security.kubernetes.io/warn: restricted      # warn on kubectl apply
+    pod-security.kubernetes.io/audit: restricted     # record in audit log
+\end{yamlcode}
+
+\section{Policy as code}
+
+For rules beyond Pod security --- ``images must come from our registry'',
+``every Deployment needs an \kc{owner} label'', ``no \kc{latest} tags'' --- use
+admission policies:
+
+\begin{itemize}
+  \item \textbf{ValidatingAdmissionPolicy} --- built in (GA since 1.30), rules
+        written in CEL, no extra software.
+  \item \textbf{Kyverno} --- policies written as Kubernetes YAML; can validate,
+        mutate, generate, and verify image signatures.
+  \item \textbf{OPA Gatekeeper} --- policies in the Rego language.
+\end{itemize}
+
+\begin{yamlcode}{no-latest-tag.yaml}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: no-latest-tag
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["deployments"]
+  validations:
+    - expression: >-
+        object.spec.template.spec.containers.all(c,
+          !c.image.endsWith(':latest') && c.image.contains(':'))
+      message: "Images must use an explicit, non-latest tag."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: no-latest-tag
+spec:
+  policyName: no-latest-tag
+  validationActions: ["Deny"]
+\end{yamlcode}
+
+\section{Supply-chain security}
+
+\begin{itemize}
+  \item \textbf{Scan images} for known vulnerabilities in CI (Trivy, Grype)
+        and continuously in the registry.
+  \item \textbf{Use minimal base images} (distroless, Chainguard, \kc{-slim}).
+  \item \textbf{Sign images} with Sigstore \textbf{cosign} and verify signatures
+        at admission (Kyverno, Sigstore policy-controller).
+  \item \textbf{Generate SBOMs} (software bills of materials) with Syft or BuildKit.
+  \item \textbf{Pin by digest} so the image you tested is the image you run.
+\end{itemize}
+
+\begin{bashcode}{terminal}
+trivy image --severity HIGH,CRITICAL ghcr.io/example/api:1.4.0
+cosign sign ghcr.io/example/api@sha256:3b1f...
+cosign verify ghcr.io/example/api@sha256:3b1f... \
+  --certificate-identity-regexp 'https://github.com/example/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+\end{bashcode}
+
+\section{Runtime security and auditing}
+
+\begin{itemize}
+  \item \textbf{Falco} or \textbf{Tetragon} detect suspicious behaviour at
+        runtime (a shell spawned in a container, unexpected file writes).
+  \item \textbf{Audit logging} on the API server records who did what and when.
+  \item \textbf{kube-bench} checks a cluster against the CIS Kubernetes Benchmark.
+\end{itemize}
+
+\section{Hardening checklist}
+
+\begin{multicols}{2}
+\begin{itemize}
+  \item[\textcolor{k8sgreen}{\faCheckSquare}] API server not public, or behind IP allow-lists
+  \item[\textcolor{k8sgreen}{\faCheckSquare}] SSO/OIDC for humans; no shared admin kubeconfigs
+  \item[\textcolor{k8sgreen}{\faCheckSquare}] Least-privilege RBAC, reviewed regularly
+  \item[\textcolor{k8sgreen}{\faCheckSquare}] \kc{restricted} Pod Security on app namespaces
+  \item[\textcolor{k8sgreen}{\faCheckSquare}] Default-deny NetworkPolicies
+  \item[\textcolor{k8sgreen}{\faCheckSquare}] Secrets encrypted at rest; external secret manager
+  \item[\textcolor{k8sgreen}{\faCheckSquare}] Images scanned, signed, pinned by digest
+  \item[\textcolor{k8sgreen}{\faCheckSquare}] Non-root, read-only root FS, all capabilities dropped
+  \item[\textcolor{k8sgreen}{\faCheckSquare}] Resource requests/limits everywhere
+  \item[\textcolor{k8sgreen}{\faCheckSquare}] Audit logs shipped off-cluster
+  \item[\textcolor{k8sgreen}{\faCheckSquare}] Cluster and nodes kept on supported versions
+  \item[\textcolor{k8sgreen}{\faCheckSquare}] etcd backups tested by restoring
+\end{itemize}
+\end{multicols}
+
+\begin{recap}
+\begin{itemize}
+  \item Authentication is external; ServiceAccounts identify workloads.
+  \item RBAC = Roles (what) + Bindings (who); grant the minimum.
+  \item Harden Pods with \kc{securityContext}; enforce with Pod Security Admission.
+  \item Use admission policies, image scanning, and signing to secure the supply chain.
+\end{itemize}
+\end{recap}

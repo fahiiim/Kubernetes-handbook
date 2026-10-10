@@ -1,0 +1,127 @@
+\chapter*{Preface}
+\addcontentsline{toc}{chapter}{Preface}
+\markboth{Preface}{}
+
+\section*{Who this handbook is for}
+
+This handbook is written for someone who has \emph{never} touched Kubernetes.
+You do not need to know what a container is, what ``orchestration'' means, or
+why everyone keeps talking about YAML. If you can open a terminal, run a
+command, and read a little code, you have everything you need.
+
+By the last page you will be able to:
+
+\begin{itemize}
+  \item explain, in plain words, what Kubernetes is and why it exists;
+  \item describe every major component of a cluster and what it does;
+  \item write and apply manifests for Pods, Deployments, Services, Gateways,
+        ConfigMaps, Secrets, volumes, Jobs, StatefulSets and more;
+  \item secure, scale, observe, and troubleshoot real workloads;
+  \item package applications with Helm and Kustomize, extend Kubernetes with
+        CRDs and Operators, and deliver changes with CI/CD and GitOps;
+  \item take a real multi-service application from source code all the way to a
+        monitored, autoscaled, GitOps-managed deployment.
+\end{itemize}
+
+\section*{How the book is organised}
+
+The book climbs a staircase. Each part assumes only what came before it.
+
+\begin{center}
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  stage/.style={regular polygon, regular polygon sides=7, fill=k8sblue,
+               text=white, minimum size=2.1cm, inner sep=0pt, font=\bfseries\Large},
+  lbl/.style={text width=2.6cm, align=center, font=\footnotesize\bfseries, text=k8snavy}]
+  \foreach \rom/\lab/\col [count=\n] in {I/Foundations/k8sblue, II/Workloads/k8sblue,
+       III/Networking/k8sdeep, IV/Config \& Storage/k8sdeep, V/Operations/k8snavy,
+       VI/Advanced/k8snavy, VII/Capstone/k8sorange}{
+    \node[stage, fill=\col] (s\n) at (\n*2.9, \n*0.45) {\rom};
+    \node[lbl, below=0.15cm of s\n] {\lab};
+  }
+  \foreach \a/\b in {1/2,2/3,3/4,4/5,5/6,6/7}
+    \draw[-{Stealth[length=3mm]}, line width=1.4pt, k8smid] (s\a) -- (s\b);
+  \node[font=\footnotesize\itshape, text=k8sgray] at (2.9,-1.6) {beginner};
+  \node[font=\footnotesize\itshape, text=k8sgray] at (20.3,1.6) {production-ready};
+\end{tikzpicture}}
+\end{center}
+
+\begin{description}[leftmargin=0pt, itemsep=0.4em]
+  \item[\textcolor{k8sblue}{Part I -- Foundations.}] Containers, the problem
+        Kubernetes solves, cluster architecture, installing a local cluster, and
+        the \kc{kubectl}/YAML workflow.
+  \item[\textcolor{k8sblue}{Part II -- Running Workloads.}] Pods, labels and
+        namespaces, Deployments and rollouts, StatefulSets, DaemonSets, Jobs and
+        CronJobs.
+  \item[\textcolor{k8sblue}{Part III -- Networking.}] Services, DNS, Ingress,
+        the Gateway API, and NetworkPolicies.
+  \item[\textcolor{k8sblue}{Part IV -- Configuration \& Storage.}] ConfigMaps,
+        Secrets, Volumes, PersistentVolumes and StorageClasses.
+  \item[\textcolor{k8sblue}{Part V -- Operating Kubernetes.}] Requests and
+        limits, scheduling, autoscaling, security, logging, metrics and tracing.
+  \item[\textcolor{k8sblue}{Part VI -- Advanced Kubernetes.}] Helm, Kustomize,
+        CRDs, Operators, GitOps, CI/CD, and running clusters in production.
+  \item[\textcolor{k8sorange}{Part VII -- Capstone.}] We build \textbf{TaskFlow},
+        a small but realistic three-tier application, and do \emph{all} of the
+        DevOps work on Kubernetes: images, manifests, Kustomize overlays, a Helm
+        chart, a CI pipeline, GitOps with Argo CD, autoscaling, network
+        policies, monitoring and alerts.
+\end{description}
+
+\section*{How to read the boxes}
+
+Throughout the book, coloured boxes highlight different kinds of information:
+
+\begin{keyidea}
+A concept you must remember. If you only read the Key Idea boxes, you will
+still understand the shape of Kubernetes.
+\end{keyidea}
+
+\begin{analogy}
+An everyday comparison that makes an abstract idea concrete.
+\end{analogy}
+
+\begin{tryit}
+A short hands-on exercise. Do them; Kubernetes is learned with your fingers.
+\end{tryit}
+
+\begin{warningbox}
+A common mistake, a trap, or something that can hurt you in production.
+\end{warningbox}
+
+\begin{protip}
+A habit or shortcut used by experienced engineers.
+\end{protip}
+
+\begin{deepdive}
+Optional detail about how something works internally. Skip on first reading.
+\end{deepdive}
+
+\section*{Conventions}
+
+Commands you type are shown in terminal boxes. Files are shown with their file
+name in the title bar:
+
+\begin{bashcode}{terminal}
+# Lines starting with # are comments; you do not type them.
+kubectl get pods
+\end{bashcode}
+
+\begin{yamlcode}{hello.yaml}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hello
+\end{yamlcode}
+
+Kubernetes moves quickly. Everything here targets Kubernetes \textbf{v1.30 and
+newer}. Where a tool version appears (for example a Helm chart version), check
+the project's site for the latest release before you copy it.
+
+\section*{Trademarks}
+
+Kubernetes and the Kubernetes logo are trademarks of The Linux Foundation. The
+Kubernetes resource icons come from the official \kc{kubernetes/community}
+repository. Docker, Helm, Prometheus, Argo, etcd, containerd, Istio and other
+names and logos belong to their respective owners and are used here only to
+identify those projects.

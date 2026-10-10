@@ -1,0 +1,4 @@
+kubectl get nodes                                  # NotReady?
+kubectl describe node <node>                       # Conditions: MemoryPressure, DiskPressure, PIDPressure
+kubectl get --raw='/readyz?verbose'                # API server health checks
+kubectl get pods -n kube-system                    # control-plane and add-on Pods healthy?

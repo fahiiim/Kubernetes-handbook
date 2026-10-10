@@ -1,0 +1,263 @@
+\kchapter{StatefulSets, DaemonSets, Jobs, and CronJobs}{sts}
+
+\begin{objectives}
+\begin{itemize}
+  \item which workload controller to choose for which job;
+  \item StatefulSets for databases and clustered software;
+  \item DaemonSets for one-Pod-per-node agents;
+  \item Jobs and CronJobs for batch and scheduled work.
+\end{itemize}
+\end{objectives}
+
+\section{Choosing a workload type}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{3.3cm} L L}
+\kheader \kth{Controller} & \kth{Use when\ldots} & \kth{Examples} \\
+\kicon{deploy}\ Deployment & Pods are interchangeable and stateless. & Web
+   apps, APIs, workers reading a queue. \\
+\kicon{sts}\ StatefulSet & Each Pod needs a stable name and its own disk. &
+   PostgreSQL, Kafka, Elasticsearch, ZooKeeper, Redis cluster. \\
+\kicon{ds}\ DaemonSet & You need exactly one Pod on every (or some) node. &
+   Log collectors, node monitoring agents, CNI and storage plugins. \\
+\kicon{job}\ Job & Work runs to completion, then stops. & DB migrations,
+   batch processing, report generation. \\
+\kicon{cronjob}\ CronJob & A Job on a schedule. & Nightly backups, cleanup,
+   periodic sync. \\
+\end{tabularx}
+\end{center}
+
+\section{StatefulSets}
+
+Deployments treat Pods as cattle: random names, shared storage (if any), any
+order. Stateful systems need more. A \kterm{StatefulSet} guarantees:
+
+\begin{itemize}
+  \item \textbf{stable, ordinal names}: \kc{db-0}, \kc{db-1}, \kc{db-2} --- a
+        replaced \kc{db-1} is still \kc{db-1};
+  \item \textbf{stable network identity} through a headless Service:
+        \kc{db-0.db.default.svc.cluster.local};
+  \item \textbf{stable storage}: each Pod gets its own PersistentVolumeClaim
+        from \kc{volumeClaimTemplates}, which follows it across rescheduling;
+  \item \textbf{ordered} start-up, scaling, and rolling updates (0, 1, 2 \ldots).
+\end{itemize}
+
+\begin{center}
+\begin{tikzpicture}[
+  p/.style={fill=k8sblue, text=white, rounded corners=4pt, minimum width=2.1cm,
+            minimum height=0.9cm, font=\small\bfseries},
+  d/.style={cylinder, shape border rotate=90, aspect=0.25, draw=k8sdeep,
+            fill=k8slight, minimum width=1.4cm, minimum height=1.0cm, font=\scriptsize},
+  >={Stealth[length=2.5mm]}]
+  \foreach \i in {0,1,2}{
+    \node[p] (p\i) at (\i*3.2,0) {\kicon[0.9em]{pod}\ db-\i};
+    \node[d] (d\i) at (\i*3.2,-1.6) {data-db-\i};
+    \draw[<->, thick, k8sdeep] (p\i) -- (d\i);
+  }
+  \draw[->, thick, k8sorange] (p0.east) -- (p1.west);
+  \draw[->, thick, k8sorange] (p1.east) -- (p2.west);
+  \node[font=\scriptsize, text=k8sorange] at (4.8,0.75) {created in order};
+\end{tikzpicture}
+\end{center}
+
+\begin{yamlcode}{postgres-statefulset.yaml}
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+spec:
+  clusterIP: None              # "headless": DNS returns Pod IPs directly
+  selector:
+    app: db
+  ports:
+    - port: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+spec:
+  serviceName: db              # the headless Service above
+  replicas: 1
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: db-secret, key: password }
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:        # one PVC per Pod: data-db-0, data-db-1, ...
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+\end{yamlcode}
+
+\begin{warningbox}
+A StatefulSet gives you stable building blocks; it does \textbf{not} make a
+database highly available, replicate data, or take backups. For production
+databases use a managed service or a mature \textbf{Operator} (e.g.\
+CloudNativePG, Percona, Strimzi for Kafka) --- see Chapter 19.
+\end{warningbox}
+
+Deleting a StatefulSet does \emph{not} delete its PVCs by default --- your data
+survives. Control this with \kc{persistentVolumeClaimRetentionPolicy}.
+
+\section{DaemonSets}
+
+A \kterm{DaemonSet} runs one copy of a Pod on every node. When a node joins,
+it gets the Pod; when a node leaves, the Pod is garbage-collected.
+
+\begin{yamlcode}{node-agent-daemonset.yaml}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-agent
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: node-agent
+  template:
+    metadata:
+      labels:
+        app: node-agent
+    spec:
+      tolerations:                         # also run on control-plane nodes
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: agent
+          image: prom/node-exporter:v1.8.2
+          ports:
+            - containerPort: 9100
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits:   { memory: 64Mi }
+\end{yamlcode}
+
+Use a \kc{nodeSelector} or node affinity in the template to target only some
+nodes (for example, only GPU nodes).
+
+\section{Jobs}
+
+A \kterm{Job} creates Pods that run until they \emph{succeed}. If a Pod fails,
+the Job retries it (up to \kc{backoffLimit}).
+
+\begin{yamlcode}{pi-job.yaml}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pi
+spec:
+  completions: 5             # need 5 successful Pods in total
+  parallelism: 2             # run up to 2 at a time
+  backoffLimit: 3            # retries before the Job is marked Failed
+  activeDeadlineSeconds: 600 # give up after 10 minutes
+  ttlSecondsAfterFinished: 3600   # auto-delete 1 hour after finishing
+  template:
+    spec:
+      restartPolicy: Never   # Jobs must use Never or OnFailure
+      containers:
+        - name: pi
+          image: perl:5.40
+          command: ["perl", "-Mbignum=bpi", "-wle", "print bpi(500)"]
+\end{yamlcode}
+
+\begin{bashcode}{terminal}
+kubectl apply -f pi-job.yaml
+kubectl get jobs -w
+kubectl logs job/pi
+\end{bashcode}
+
+\begin{protip}
+\kc{completionMode: Indexed} gives each Pod an index (\kc{JOB\_COMPLETION\_INDEX}
+env var), which is perfect for splitting work into shards: Pod 0 processes
+file 0, Pod 1 file 1, and so on.
+\end{protip}
+
+\section{CronJobs}
+
+A \kterm{CronJob} creates a Job on a schedule written in classic cron syntax.
+
+\begin{center}
+\begin{tikzpicture}[
+  f/.style={fill=k8sblue, text=white, rounded corners=4pt, minimum width=1.5cm,
+            minimum height=1cm, font=\ttfamily\Large\bfseries},
+  l/.style={font=\scriptsize, text=k8snavy, align=center, text width=1.9cm}]
+  \foreach \x/\v/\lbl in {0/30/minute\\(0-59), 2.2/2/hour\\(0-23), 4.4/*/day of\\month (1-31),
+                          6.6/*/month\\(1-12), 8.8/1-5/{day of week\\(0-6; Sun=0)}}{
+    \node[f] at (\x,0) {\v};
+    \node[l] at (\x,-1.05) {\lbl};
+  }
+  \node[font=\footnotesize\itshape, text=k8sgray] at (4.4,-1.9) {``30 2 * * 1-5'' = 02:30 every Monday to Friday};
+\end{tikzpicture}
+\end{center}
+
+\begin{yamlcode}{backup-cronjob.yaml}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nightly-backup
+spec:
+  schedule: "30 2 * * *"           # 02:30 every day
+  timeZone: "Asia/Dhaka"           # optional; defaults to the controller's zone (UTC)
+  concurrencyPolicy: Forbid         # skip if the previous run is still going
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 300
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: postgres:16-alpine
+              command: ["sh", "-c", "pg_dump -h db -U postgres app > /backup/app-$(date +%F).sql"]
+              env:
+                - name: PGPASSWORD
+                  valueFrom:
+                    secretKeyRef: { name: db-secret, key: password }
+              volumeMounts:
+                - name: backup
+                  mountPath: /backup
+          volumes:
+            - name: backup
+              persistentVolumeClaim:
+                claimName: backups
+\end{yamlcode}
+
+\begin{bashcode}{terminal}
+kubectl get cronjobs
+kubectl create job --from=cronjob/nightly-backup manual-run-1   # run it now
+\end{bashcode}
+
+\begin{recap}
+\begin{itemize}
+  \item Deployment: stateless and interchangeable. StatefulSet: identity + own disk.
+  \item DaemonSet: one per node. Job: run to completion. CronJob: Jobs on a schedule.
+  \item Stateful workloads in production usually deserve an Operator.
+\end{itemize}
+\end{recap}

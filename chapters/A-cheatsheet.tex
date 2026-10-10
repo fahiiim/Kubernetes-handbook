@@ -1,0 +1,130 @@
+\kchapter{kubectl Cheat Sheet}{api}
+
+\section{Context and configuration}
+
+\begin{bashcode}{terminal}
+kubectl config get-contexts
+kubectl config use-context <name>
+kubectl config set-context --current --namespace=<ns>
+kubectl cluster-info
+kubectl version
+kubectl api-resources
+kubectl explain <kind>.<field> --recursive
+\end{bashcode}
+
+\section{Viewing resources}
+
+\begin{bashcode}{terminal}
+kubectl get pods|deploy|svc|ing|cm|secret|pvc|nodes [-n ns | -A] [-o wide|yaml|json|name]
+kubectl get pods -l app=web --show-labels
+kubectl get pods --field-selector status.phase=Running
+kubectl get pods --sort-by=.metadata.creationTimestamp
+kubectl get pods -w
+kubectl describe <kind> <name>
+kubectl get events --sort-by=.lastTimestamp
+kubectl get all -n <ns>
+kubectl top nodes | pods
+\end{bashcode}
+
+\section{Creating and changing}
+
+\begin{bashcode}{terminal}
+kubectl apply -f file.yaml | -f dir/ | -k overlay/
+kubectl diff -f file.yaml
+kubectl delete -f file.yaml
+kubectl create deployment web --image=nginx:1.27 --replicas=3 --dry-run=client -o yaml
+kubectl expose deployment web --port=80 --target-port=8080
+kubectl create configmap cfg --from-literal=KEY=value --from-file=app.conf
+kubectl create secret generic s --from-literal=password=xyz
+kubectl edit deployment web
+kubectl patch deployment web -p '{"spec":{"replicas":5}}'
+kubectl label pod p env=dev --overwrite
+kubectl annotate deployment web owner=team-a
+kubectl scale deployment web --replicas=5
+kubectl autoscale deployment web --cpu-percent=70 --min=2 --max=10
+\end{bashcode}
+
+\section{Rollouts}
+
+\begin{bashcode}{terminal}
+kubectl set image deployment/web web=nginx:1.28
+kubectl rollout status deployment/web
+kubectl rollout history deployment/web
+kubectl rollout undo deployment/web [--to-revision=N]
+kubectl rollout restart deployment/web
+kubectl rollout pause|resume deployment/web
+\end{bashcode}
+
+\section{Debugging}
+
+\begin{bashcode}{terminal}
+kubectl logs <pod> [-c container] [-f] [--previous] [--since=10m] [--tail=100]
+kubectl logs -l app=web --all-containers --prefix
+kubectl exec -it <pod> [-c container] -- sh
+kubectl port-forward pod/<pod> | svc/<svc> 8080:80
+kubectl debug -it <pod> --image=busybox:1.36 --target=<container>
+kubectl debug node/<node> -it --image=busybox:1.36
+kubectl run tmp --rm -it --image=busybox:1.36 -- sh
+kubectl cp <pod>:/path/file ./file
+kubectl auth can-i <verb> <resource> [--as=user] [-n ns]
+\end{bashcode}
+
+\section{Nodes}
+
+\begin{bashcode}{terminal}
+kubectl get nodes -o wide
+kubectl describe node <node>
+kubectl cordon | uncordon <node>
+kubectl drain <node> --ignore-daemonsets --delete-emptydir-data
+kubectl taint nodes <node> key=value:NoSchedule[-]
+kubectl label node <node> disktype=ssd
+\end{bashcode}
+
+\section{JSONPath and output tricks}
+
+\begin{bashcode}{terminal}
+kubectl get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\n"}{end}'
+kubectl get nodes -o custom-columns=NAME:.metadata.name,CPU:.status.capacity.cpu,MEM:.status.capacity.memory
+kubectl get secret s -o jsonpath='{.data.password}' | base64 -d
+kubectl get deploy -A -o jsonpath='{.items[*].spec.template.spec.containers[*].image}' | tr ' ' '\n' | sort -u
+\end{bashcode}
+
+\section{Short names}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{1.7cm} L P{1.7cm} L}
+\kheader \kth{Short} & \kth{Kind} & \kth{Short} & \kth{Kind} \\
+\kc{po} & Pod & \kc{svc} & Service \\
+\kc{deploy} & Deployment & \kc{ing} & Ingress \\
+\kc{rs} & ReplicaSet & \kc{netpol} & NetworkPolicy \\
+\kc{sts} & StatefulSet & \kc{cm} & ConfigMap \\
+\kc{ds} & DaemonSet & \kc{pv} / \kc{pvc} & (Claim) PersistentVolume \\
+\kc{cj} & CronJob & \kc{sc} & StorageClass \\
+\kc{hpa} & HorizontalPodAutoscaler & \kc{sa} & ServiceAccount \\
+\kc{pdb} & PodDisruptionBudget & \kc{crd} & CustomResourceDefinition \\
+\kc{ns} & Namespace & \kc{no} & Node \\
+\kc{ep} & Endpoints & \kc{ev} & Event \\
+\end{tabularx}
+\end{center}
+
+\section{The resource icon set}
+
+The official Kubernetes icons used throughout this handbook:
+
+\begin{center}
+\setlength{\tabcolsep}{6pt}
+\renewcommand{\arraystretch}{1.1}
+\begin{tabular}{cccccccc}
+\kimg[1.2cm]{pod} & \kimg[1.2cm]{deploy} & \kimg[1.2cm]{rs} & \kimg[1.2cm]{sts} &
+\kimg[1.2cm]{ds} & \kimg[1.2cm]{job} & \kimg[1.2cm]{cronjob} & \kimg[1.2cm]{svc} \\[4pt]
+\kimg[1.2cm]{ing} & \kimg[1.2cm]{ep} & \kimg[1.2cm]{netpol} & \kimg[1.2cm]{cm} &
+\kimg[1.2cm]{secret} & \kimg[1.2cm]{vol} & \kimg[1.2cm]{pv} & \kimg[1.2cm]{pvc} \\[4pt]
+\kimg[1.2cm]{sc} & \kimg[1.2cm]{ns} & \kimg[1.2cm]{quota} & \kimg[1.2cm]{limits} &
+\kimg[1.2cm]{hpa} & \kimg[1.2cm]{sa} & \kimg[1.2cm]{role} & \kimg[1.2cm]{rb} \\[4pt]
+\kimg[1.2cm]{c-role} & \kimg[1.2cm]{crb} & \kimg[1.2cm]{user} & \kimg[1.2cm]{group} &
+\kimg[1.2cm]{crd} & \kimg[1.2cm]{node} & \kimg[1.2cm]{api} & \kimg[1.2cm]{etcd} \\[4pt]
+\kimg[1.2cm]{sched} & \kimg[1.2cm]{c-m} & \kimg[1.2cm]{c-c-m} & \kimg[1.2cm]{kubelet} &
+\kimg[1.2cm]{k-proxy} & \kimg[1.2cm]{control-plane} & & \\
+\end{tabular}
+\end{center}

@@ -1,0 +1,225 @@
+\kchapter{Observability: Logs, Metrics, Traces}{prometheus}
+
+\begin{objectives}
+\begin{itemize}
+  \item the three pillars of observability and how they fit together;
+  \item how container logging works and how to centralise logs;
+  \item metrics with Prometheus and dashboards with Grafana;
+  \item alerts that wake you up only when it matters;
+  \item distributed tracing with OpenTelemetry.
+\end{itemize}
+\end{objectives}
+
+\section{Why observability?}
+
+In a cluster, Pods move, scale, and die constantly. You cannot SSH into ``the
+server'' to look around. You need the system to \emph{tell you} what is going
+on. That ability is \kterm{observability}, built from three signals:
+
+\begin{center}
+\resizebox{0.95\linewidth}{!}{%
+\begin{tikzpicture}[
+  card/.style={draw=#1, fill=#1!8, rounded corners=6pt, line width=1pt,
+               minimum width=4.6cm, minimum height=3.1cm, align=center, text width=4.2cm,
+               font=\footnotesize, text=k8snavy}]
+  \node[card=k8sblue] at (0,0) {{\Large\color{k8sblue}\faStream}\\[3pt]{\large\bfseries Logs}\\[3pt]
+     \emph{What happened?}\\Timestamped text events.\\[2pt]\scriptsize Loki, Elasticsearch, CloudWatch};
+  \node[card=k8sorange] at (5.2,0) {{\Large\color{k8sorange}\faChartLine}\\[3pt]{\large\bfseries Metrics}\\[3pt]
+     \emph{How much / how often?}\\Numbers over time.\\[2pt]\scriptsize Prometheus, Grafana, Mimir};
+  \node[card=k8spurple] at (10.4,0) {{\Large\color{k8spurple}\faProjectDiagram}\\[3pt]{\large\bfseries Traces}\\[3pt]
+     \emph{Where did the time go?}\\One request across services.\\[2pt]\scriptsize OpenTelemetry, Tempo, Jaeger};
+\end{tikzpicture}}
+\end{center}
+
+\section{Logs}
+
+Containers write to \kc{stdout} and \kc{stderr}. The container runtime saves
+that output to files on the node, and the kubelet serves them to
+\kc{kubectl logs}.
+
+\begin{bashcode}{terminal}
+kubectl logs deploy/api                     # one Pod of the Deployment
+kubectl logs -l app=api --all-containers --prefix --since=15m
+kubectl logs api-7d9f8c-xk2lp --previous    # the run before the last crash
+kubectl logs -f api-7d9f8c-xk2lp
+stern api -n shop                           # tail all matching Pods, colourised
+\end{bashcode}
+
+\begin{warningbox}
+Node log files are rotated and disappear with the node. For anything beyond
+live debugging, ship logs to a central store: a DaemonSet agent
+(\textbf{Fluent Bit}, \textbf{Grafana Alloy}, \textbf{Vector}) on each node reads
+the log files and forwards them to \textbf{Loki}, \textbf{Elasticsearch/OpenSearch},
+or your cloud's logging service.
+\end{warningbox}
+
+\begin{protip}
+Log in \textbf{structured JSON} with fields like \kc{level}, \kc{msg},
+\kc{trace\_id}, and \kc{user\_id}. Structured logs can be filtered and
+correlated; free text can only be grepped.
+\end{protip}
+
+\section{Metrics with Prometheus}
+
+\kicon{prometheus}~\textbf{Prometheus} is the CNCF standard for metrics. It
+\emph{pulls} (``scrapes'') an HTTP endpoint, usually \kc{/metrics}, on every
+target every 15--30 seconds and stores the numbers as time series.
+
+\begin{plaincode}{GET /metrics}
+# HELP http_requests_total Total HTTP requests.
+# TYPE http_requests_total counter
+http_requests_total{method="GET",handler="/api/tasks",status="2xx"} 10432
+http_requests_total{method="POST",handler="/api/tasks",status="5xx"} 3
+# HELP http_request_duration_seconds Request latency.
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{handler="/api/tasks",le="0.1"} 9870
+\end{plaincode}
+
+\subsection{The kube-prometheus-stack}
+
+The easiest way to get a complete monitoring setup is the
+\textbf{kube-prometheus-stack} Helm chart. It installs:
+
+\begin{itemize}
+  \item the \textbf{Prometheus Operator} and a Prometheus server;
+  \item \textbf{Alertmanager} for routing alerts (Slack, PagerDuty, e-mail);
+  \item \textbf{Grafana} with ready-made dashboards for nodes, Pods, and workloads;
+  \item \textbf{node-exporter} (node metrics) and \textbf{kube-state-metrics}
+        (object state: replicas, Pod phases, restarts).
+\end{itemize}
+
+\begin{bashcode}{terminal}
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+helm install monitoring prometheus-community/kube-prometheus-stack \
+  --namespace monitoring --create-namespace
+
+kubectl -n monitoring port-forward svc/monitoring-grafana 3000:80
+# open http://localhost:3000  (user: admin; password below)
+kubectl -n monitoring get secret monitoring-grafana \
+  -o jsonpath='{.data.admin-password}' | base64 -d
+\end{bashcode}
+
+\subsection{Telling Prometheus what to scrape}
+
+With the operator, you describe scrape targets with a \kc{ServiceMonitor}:
+
+\begin{yamlcode}{api-servicemonitor.yaml}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: api
+  namespace: shop
+  labels:
+    release: monitoring        # the chart's default selector picks this up
+spec:
+  selector:
+    matchLabels:
+      app: api                 # the Service to scrape
+  endpoints:
+    - port: http               # named Service port
+      path: /metrics
+      interval: 15s
+\end{yamlcode}
+
+\subsection{PromQL in five queries}
+
+\begin{plaincode}{PromQL}
+# Requests per second, per handler, over the last 5 minutes
+sum by (handler) (rate(http_requests_total[5m]))
+
+# Error ratio (5xx / all)
+sum(rate(http_requests_total{status="5xx"}[5m])) / sum(rate(http_requests_total[5m]))
+
+# 95th percentile latency
+histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))
+
+# Container restarts in the last hour
+increase(kube_pod_container_status_restarts_total[1h]) > 0
+
+# Memory usage as % of limit
+container_memory_working_set_bytes / on(pod, container) kube_pod_container_resource_limits{resource="memory"}
+\end{plaincode}
+
+\section{What to measure: golden signals}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{2.4cm} L}
+\kheader \kth{Signal} & \kth{Question} \\
+\textbf{Latency} & How long do requests take (p50, p95, p99)? \\
+\textbf{Traffic} & How many requests per second? \\
+\textbf{Errors} & What fraction of requests fail? \\
+\textbf{Saturation} & How full is the system (CPU, memory, queue depth, connections)? \\
+\end{tabularx}
+\end{center}
+
+\section{Alerts}
+
+\begin{yamlcode}{api-alerts.yaml}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: api-alerts
+  namespace: shop
+  labels:
+    release: monitoring
+spec:
+  groups:
+    - name: api.rules
+      rules:
+        - alert: APIHighErrorRate
+          expr: |
+            sum(rate(http_requests_total{namespace="shop",status="5xx"}[5m]))
+              / sum(rate(http_requests_total{namespace="shop"}[5m])) > 0.05
+          for: 10m
+          labels:
+            severity: page
+          annotations:
+            summary: "API error rate above 5% for 10 minutes"
+            runbook_url: "https://wiki.example.com/runbooks/api-errors"
+\end{yamlcode}
+
+\begin{protip}
+Alert on \textbf{symptoms users feel} (error rate, latency, availability ---
+ideally expressed as SLOs), not on every cause (``CPU is 80\%''). Every paging
+alert should be actionable and link to a runbook.
+\end{protip}
+
+\section{Traces with OpenTelemetry}
+
+A single click may touch a gateway, three services, a cache, and a database. A
+\kterm{trace} follows that request end-to-end as a tree of timed
+\kterm{spans}. \textbf{OpenTelemetry} (OTel) is the vendor-neutral standard:
+instrument once with the OTel SDK, send data to an \textbf{OTel Collector}
+running in the cluster, and export to Tempo, Jaeger, or a commercial backend.
+
+\begin{yamlcode}{otel-env.yaml}
+env:
+  - name: OTEL_SERVICE_NAME
+    value: taskflow-api
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability:4317
+  - name: OTEL_RESOURCE_ATTRIBUTES
+    value: deployment.environment=production
+\end{yamlcode}
+
+\section{Kubernetes events}
+
+Events are the cluster's own log: scheduling decisions, image pulls, probe
+failures, OOM kills. They expire after about an hour, so export them
+(kube-state-metrics, an event exporter) if you want history.
+
+\begin{bashcode}{terminal}
+kubectl get events -n shop --sort-by=.lastTimestamp
+kubectl get events -A --field-selector type=Warning
+\end{bashcode}
+
+\begin{recap}
+\begin{itemize}
+  \item Logs: stdout/stderr, shipped by a node agent to a central store.
+  \item Metrics: Prometheus scrapes \kc{/metrics}; Grafana visualises; Alertmanager notifies.
+  \item ServiceMonitors and PrometheusRules configure monitoring declaratively.
+  \item Traces: OpenTelemetry shows where time goes across services.
+\end{itemize}
+\end{recap}

@@ -1,0 +1,256 @@
+\kchapter{Resources and Scheduling}{quota}
+
+\begin{objectives}
+\begin{itemize}
+  \item CPU and memory \emph{requests} and \emph{limits}, and their units;
+  \item Quality-of-Service classes and what happens under pressure;
+  \item LimitRanges and ResourceQuotas for namespaces;
+  \item controlling placement: nodeSelector, affinity, taints and tolerations,
+        topology spread, priority and preemption;
+  \item PodDisruptionBudgets and node draining.
+\end{itemize}
+\end{objectives}
+
+\section{Requests and limits}
+
+Each container can declare two numbers per resource:
+
+\begin{itemize}
+  \item \kterm{request} --- what the container is \emph{guaranteed}. The
+        scheduler only places a Pod on a node with enough unrequested capacity.
+  \item \kterm{limit} --- the \emph{maximum} it may use.
+\end{itemize}
+
+\begin{yamlcode}{resources.yaml}
+resources:
+  requests:
+    cpu: 250m          # 250 millicores = 1/4 of a CPU core
+    memory: 256Mi      # mebibytes (Mi, Gi) -- not MB
+  limits:
+    cpu: "1"           # optional, see the Pro Tip below
+    memory: 512Mi
+\end{yamlcode}
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{2.0cm} L L}
+\kheader \kth{} & \kth{CPU (compressible)} & \kth{Memory (incompressible)} \\
+Units & \kc{1} = one core; \kc{500m} = half a core. & \kc{Mi}, \kc{Gi} (powers of 2); \kc{M}, \kc{G} (powers of 10). \\
+Over limit & The container is \textbf{throttled} (slowed down). & The container is \textbf{OOM-killed} and restarted. \\
+\end{tabularx}
+\end{center}
+
+\begin{protip}
+Always set \textbf{memory requests and limits} (often equal). Always set
+\textbf{CPU requests}. Many teams \emph{omit CPU limits} for latency-sensitive
+services, because CPU throttling causes hard-to-diagnose slowness while idle
+cores sit unused. Measure first with \kc{kubectl top} and your monitoring.
+\end{protip}
+
+\section{Quality of Service classes}
+
+From requests and limits, Kubernetes assigns each Pod a QoS class. When a node
+runs out of memory, the kubelet evicts Pods in this order: BestEffort first,
+then Burstable, and Guaranteed last.
+
+\begin{center}
+\ktablestart
+\begin{tabularx}{\linewidth}{P{2.6cm} L P{3.0cm}}
+\kheader \kth{Class} & \kth{Rule} & \kth{Eviction priority} \\
+\textcolor{k8sgreen}{\textbf{Guaranteed}} & Every container has CPU and memory requests \emph{equal to} limits. & Last to go. \\
+\textcolor{k8sorange}{\textbf{Burstable}} & At least one request or limit set, but not Guaranteed. & Middle. \\
+\textcolor{k8sred}{\textbf{BestEffort}} & No requests or limits at all. & First to go. \\
+\end{tabularx}
+\end{center}
+
+\section{Namespace guard rails}
+
+\subsection{\kicon{limits}\ LimitRange: defaults per container}
+
+\begin{yamlcode}{limitrange.yaml}
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: defaults
+  namespace: shop
+spec:
+  limits:
+    - type: Container
+      defaultRequest: { cpu: 100m, memory: 128Mi }   # applied if omitted
+      default:        { memory: 256Mi }              # default limit
+      max:            { cpu: "2", memory: 2Gi }
+\end{yamlcode}
+
+\subsection{\kicon{quota}\ ResourceQuota: a budget per namespace}
+
+\begin{yamlcode}{quota.yaml}
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: shop-budget
+  namespace: shop
+spec:
+  hard:
+    requests.cpu: "8"
+    requests.memory: 16Gi
+    limits.memory: 32Gi
+    pods: "60"
+    persistentvolumeclaims: "10"
+    services.loadbalancers: "1"
+\end{yamlcode}
+
+\begin{bashcode}{terminal}
+kubectl describe quota shop-budget -n shop     # used vs hard
+\end{bashcode}
+
+\section{Controlling where Pods run}
+
+\subsection{nodeSelector: the simple way}
+
+\begin{bashcode}{terminal}
+kubectl label node lab-worker disktype=ssd
+\end{bashcode}
+
+\begin{yamlcode}{nodeselector.yaml}
+spec:
+  nodeSelector:
+    disktype: ssd
+\end{yamlcode}
+
+\subsection{Node affinity: the expressive way}
+
+\begin{yamlcode}{node-affinity.yaml}
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:     # hard rule
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values: [amd64, arm64]
+      preferredDuringSchedulingIgnoredDuringExecution:    # soft preference
+        - weight: 80
+          preference:
+            matchExpressions:
+              - key: topology.kubernetes.io/zone
+                operator: In
+                values: [eu-west-1a]
+\end{yamlcode}
+
+\subsection{Pod affinity and anti-affinity}
+
+Place Pods \emph{relative to other Pods}: keep a cache near its app, or keep
+replicas of the same app apart.
+
+\begin{yamlcode}{pod-anti-affinity.yaml}
+spec:
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            topologyKey: kubernetes.io/hostname    # "not on the same node"
+            labelSelector:
+              matchLabels: { app: api }
+\end{yamlcode}
+
+\subsection{Topology spread constraints}
+
+The modern, more precise way to spread replicas across zones and nodes:
+
+\begin{yamlcode}{topology-spread.yaml}
+spec:
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels: { app: api }
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels: { app: api }
+\end{yamlcode}
+
+\subsection{Taints and tolerations}
+
+Affinity \emph{attracts} Pods to nodes. \kterm{Taints} \emph{repel} them: a
+tainted node accepts only Pods that \kterm{tolerate} the taint.
+
+\begin{analogy}
+A taint is a ``Staff only'' sign on a door. Most people (Pods) stay out. A
+toleration is the staff badge. Note that the badge \emph{allows} entry but does
+not \emph{force} it --- combine with affinity if you want the Pod to go there.
+\end{analogy}
+
+\begin{bashcode}{terminal}
+kubectl taint nodes gpu-node-1 gpu=true:NoSchedule
+kubectl taint nodes gpu-node-1 gpu=true:NoSchedule-     # remove (trailing dash)
+\end{bashcode}
+
+\begin{yamlcode}{toleration.yaml}
+spec:
+  tolerations:
+    - key: gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
+  nodeSelector:
+    gpu: "true"
+\end{yamlcode}
+
+Effects: \kc{NoSchedule} (do not place new Pods), \kc{PreferNoSchedule} (try
+not to), \kc{NoExecute} (also evict running Pods that do not tolerate it).
+
+\subsection{Priority and preemption}
+
+\begin{yamlcode}{priorityclass.yaml}
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: business-critical
+value: 100000
+globalDefault: false
+description: "Customer-facing services; may preempt batch work."
+---
+# in a Pod spec:
+# priorityClassName: business-critical
+\end{yamlcode}
+
+If a high-priority Pod cannot be scheduled, the scheduler may \emph{evict}
+lower-priority Pods to make room.
+
+\section{Voluntary disruptions}
+
+Node upgrades and \kc{kubectl drain} evict Pods on purpose. A
+\kterm{PodDisruptionBudget} (PDB) tells Kubernetes how many Pods of an app must
+stay up during such voluntary disruptions.
+
+\begin{yamlcode}{pdb.yaml}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-pdb
+spec:
+  minAvailable: 2           # or maxUnavailable: 1
+  selector:
+    matchLabels: { app: api }
+\end{yamlcode}
+
+\begin{bashcode}{terminal}
+kubectl cordon lab-worker                              # no new Pods here
+kubectl drain lab-worker --ignore-daemonsets --delete-emptydir-data
+kubectl uncordon lab-worker
+\end{bashcode}
+
+\begin{recap}
+\begin{itemize}
+  \item Requests drive scheduling; limits cap usage. Memory over limit = OOMKill.
+  \item QoS classes decide who gets evicted first.
+  \item LimitRanges set defaults; ResourceQuotas cap a namespace.
+  \item nodeSelector/affinity attract, taints repel, topology spread distributes.
+  \item PDBs keep apps available during drains and upgrades.
+\end{itemize}
+\end{recap}
